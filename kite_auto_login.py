@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import urllib.parse
 from datetime import datetime
@@ -74,32 +75,41 @@ def generate_kite_session():
 
         print("✓ Step 2: TOTP 2FA verified successfully.")
 
-        # Step 3: OAuth Request Token (without connecting to port 5000)
-        auth_url = f"https://kite.zerodha.com/connect/login?api_key={KITE_API_KEY}&v=3"
-        
-        redirect_url = ""
-        try:
-            # allow_redirects=False stops requests from hitting 127.0.0.1:5000
-            redirect_resp = session.get(auth_url, allow_redirects=False, timeout=10)
-            redirect_url = redirect_resp.headers.get("Location", "")
-        except requests.exceptions.ConnectionError as ce:
-            redirect_url = str(ce)
-
+        # Step 3: Follow OAuth Hops to Capture request_token
+        current_url = f"https://kite.zerodha.com/connect/login?api_key={KITE_API_KEY}&v=3"
         request_token = None
-        if "request_token=" in redirect_url:
-            parsed = urllib.parse.urlparse(redirect_url)
-            params = urllib.parse.parse_qs(parsed.query)
-            request_token = params.get("request_token", [None])[0]
+
+        # Iterate through internal Zerodha redirects (up to 5 hops)
+        for hop in range(5):
+            try:
+                r = session.get(current_url, allow_redirects=False, timeout=10)
+                loc = r.headers.get("Location", "")
+                
+                # If relative URL, expand to full Zerodha domain
+                if loc.startswith("/"):
+                    loc = "https://kite.zerodha.com" + loc
+
+                # Check if this hop contains request_token
+                if "request_token=" in loc:
+                    match = re.search(r"request_token=([a-zA-Z0-9]+)", loc)
+                    if match:
+                        request_token = match.group(1)
+                        break
+
+                if not loc:
+                    break
+
+                current_url = loc
+
+            except requests.exceptions.ConnectionError as ce:
+                # If it tried to redirect to 127.0.0.1:5000, parse the token from error URL
+                match = re.search(r"request_token=([a-zA-Z0-9]+)", str(ce))
+                if match:
+                    request_token = match.group(1)
+                break
 
         if not request_token:
-            # Fallback regex extraction if full URL is wrapped in error message
-            import re
-            match = re.search(r"request_token=([a-zA-Z0-9]+)", redirect_url)
-            if match:
-                request_token = match.group(1)
-
-        if not request_token:
-            raise Exception(f"Could not extract request_token from: {redirect_url}")
+            raise Exception(f"Could not extract request_token after OAuth redirects. Last URL: {current_url}")
 
         print(f"✓ Step 3: OAuth request_token captured: {request_token[:6]}******")
 
