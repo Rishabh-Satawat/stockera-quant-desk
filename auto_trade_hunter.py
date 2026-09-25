@@ -135,6 +135,13 @@ def hunt_market_once():
                 with open(LEDGER_FILE, "w", encoding="utf-8") as f:
                     json.dump(trades, f, indent=2, ensure_ascii=False)
 
+                try:
+                    from supabase_sync import sync_trades_to_supabase
+                    sync_trades_to_supabase()
+                except Exception as e:
+                    pass
+
+
                 cooldowns[sym] = time.time()
                 save_cooldown_state(cooldowns)
 
@@ -198,6 +205,13 @@ def hunt_market_once():
                 trades.append(new_trade)
                 with open(LEDGER_FILE, "w", encoding="utf-8") as f:
                     json.dump(trades, f, indent=2, ensure_ascii=False)
+
+                try:
+                    from supabase_sync import sync_trades_to_supabase
+                    sync_trades_to_supabase()
+                except Exception as e:
+                    pass
+
 
                 cooldowns[sym] = time.time()
                 save_cooldown_state(cooldowns)
@@ -267,6 +281,13 @@ def hunt_market_once():
             trades.append(new_trade)
             with open(LEDGER_FILE, "w", encoding="utf-8") as f:
                 json.dump(trades, f, indent=2, ensure_ascii=False)
+
+                try:
+                    from supabase_sync import sync_trades_to_supabase
+                    sync_trades_to_supabase()
+                except Exception as e:
+                    pass
+
 
             cooldowns[sym] = time.time()
             save_cooldown_state(cooldowns)
