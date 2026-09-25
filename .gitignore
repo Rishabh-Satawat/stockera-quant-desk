@@ -20,3 +20,6 @@ __pycache__/
 access_token.txt
 __pycache__/
 *.pyc
+
+secrets/
+*.env
