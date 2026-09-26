@@ -15,19 +15,26 @@ def auto_record_broadcasted_basket(sym, strat_name, spot, legs, credit, max_p, s
             except Exception:
                 trades = []
 
-    # Quota gate: Max 3 trades per day
-    if len(trades) >= 3:
-        print("⚠️ Maximum 3 trades/day quota reached.")
+    today_str = datetime.now().strftime("%Y%m%d")
+    
+    # Quota gate: Count only TODAY's trades (Max 3 trades/day)
+    today_trades = [t for t in trades if today_str in str(t.get("trade_id", ""))]
+    if len(today_trades) >= 3:
+        print(f"⚠️ Maximum 3 trades/day quota reached for today ({today_str}).")
         return False
 
-    trade_id = f"TRD-{datetime.now().strftime('%Y%m%d')}-{len(trades)+1:02d}"
+    trade_id = f"TRD-{today_str}-{len(today_trades)+1:02d}"
     
     # Extract primary contract name and estimate entry premium
     primary_leg = legs[0] if isinstance(legs, list) and len(legs) > 0 else f"{sym} Option"
     clean_contract = re.sub(r"\[.*?\]\s*", "", primary_leg).split("@")[0].strip()
     
     # Estimate entry price from credit/debit
-    entry_price = abs(float(credit)) if credit != 0 else 100.0
+    try:
+        entry_price = abs(float(credit)) if float(credit) != 0 else 100.0
+    except (ValueError, TypeError):
+        entry_price = 100.0
+
     lot_size = 30 if sym == "SENSEX" else (25 if sym == "NIFTY" else 15)
     
     # Extract Stop Loss & Target estimates
@@ -39,7 +46,7 @@ def auto_record_broadcasted_basket(sym, strat_name, spot, legs, credit, max_p, s
         "trade_id": trade_id,
         "symbol": sym,
         "contract": clean_contract,
-        "action": "BUY" if "BUY" in primary_leg else "SELL",
+        "action": "BUY" if "BUY" in str(primary_leg).upper() else "SELL",
         "strategy": strat_name,
         "qty": lot_size,
         "entry_time": datetime.now().strftime("%H:%M:%S"),
