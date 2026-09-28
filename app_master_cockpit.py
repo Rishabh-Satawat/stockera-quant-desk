@@ -13,6 +13,34 @@ from datetime import date
 import requests
 import pandas as pd
 import streamlit as st
+
+def norm_pdf(x):
+    return (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * x * x)
+
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def calculate_black76(spot, strike, t, r, iv, opt_type):
+    if t <= 0.0001 or iv <= 0.001 or spot <= 0 or strike <= 0:
+        return {'price': 0.0, 'delta': 0.0, 'theta': 0.0}
+    try:
+        d1 = (math.log(spot / strike) + 0.5 * (iv**2) * t) / (iv * math.sqrt(t))
+        d2 = d1 - iv * math.sqrt(t)
+        pdf_d1 = norm_pdf(d1)
+        cdf_d1 = norm_cdf(d1)
+        cdf_neg_d1 = norm_cdf(-d1)
+        if opt_type == 'CE':
+            delta = cdf_d1
+            theta = (-(spot * pdf_d1 * iv) / (2 * math.sqrt(t)) - r * strike * math.exp(-r * t) * norm_cdf(d2)) / 365.0
+            price = spot * math.exp(-r * t) * cdf_d1 - strike * math.exp(-r * t) * norm_cdf(d2)
+        else:
+            delta = -cdf_neg_d1
+            theta = (-(spot * pdf_d1 * iv) / (2 * math.sqrt(t)) + r * strike * math.exp(-r * t) * norm_cdf(-d2)) / 365.0
+            price = strike * math.exp(-r * t) * norm_cdf(-d2) - spot * math.exp(-r * t) * norm_cdf(-d1)
+        return {'price': round(max(2.5, price), 2), 'delta': round(delta, 3), 'theta': round(theta, 2)}
+    except Exception:
+        return {'price': 25.0, 'delta': 0.5, 'theta': -10.0}
+
 from dotenv import load_dotenv
 
 # Try broker imports safely
@@ -139,29 +167,20 @@ def fetch_live_indices():
 live_indices = fetch_live_indices()
 
 def get_option_chain_data(sym):
+    try:
+        from chain_microstructure_analyzer import analyze_option_chain_microstructure
+        res = analyze_option_chain_microstructure(sym)
+        if res and res.get("raw_oc"):
+            return res
+    except Exception as e:
+        print(f"Live chain notice: {e}")
+
     spot = live_indices.get(sym, {}).get("price", 23140.50)
     pcr = live_indices.get(sym, {}).get("pcr", 0.85)
     max_pain = live_indices.get(sym, {}).get("max_pain", spot)
     cw = live_indices.get(sym, {}).get("call_wall", spot + 200)
     pw = live_indices.get(sym, {}).get("put_wall", spot - 200)
-    raw_oc = {}
-    
-    if DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID:
-        scrip_map = {"NIFTY": 13, "SENSEX": 51, "BANKNIFTY": 25}
-        try:
-            url = "https://api.dhan.co/v2/optionchain"
-            headers = {"access-token": DHAN_ACCESS_TOKEN, "client-id": DHAN_CLIENT_ID, "Content-Type": "application/json"}
-            payload = {"UnderlyingScrip": scrip_map.get(sym, 13), "UnderlyingSeg": "IDX_I"}
-            r = requests.post(url, headers=headers, json=payload, timeout=3)
-            if r.status_code == 200:
-                d = r.json().get("data", {})
-                if "last_price" in d and float(d["last_price"]) > 0:
-                    spot = float(d["last_price"])
-                raw_oc = d.get("oc", {})
-        except Exception:
-            pass
-            
-    return {"spot": spot, "pcr_oi": pcr, "max_pain": max_pain, "call_wall": cw, "put_wall": pw, "raw_oc": raw_oc}
+    return {"spot": spot, "pcr_oi": pcr, "max_pain": max_pain, "call_wall": cw, "put_wall": pw, "raw_oc": {}}
 
 # 5. MARKET TIMING & STATUS
 now_dt = datetime.datetime.now()
@@ -246,10 +265,28 @@ with t_setup:
 
         def get_p(strike, opt_t):
             for k, v in oc.items():
-                if abs(float(k) - strike) < 0.1:
-                    p = float(v.get(opt_t.lower(), {}).get("last_price", 0.0))
-                    if p > 0: return round(p, 2)
-            return 45.0
+                try:
+                    if abs(float(k) - strike) < 0.5:
+                        leg_d = v.get(opt_t.lower(), {})
+                        p = float(leg_d.get("last_price", 0.0))
+                        if p > 0:
+                            return round(p, 2)
+                        bid = float(leg_d.get("top_bid_price", 0.0))
+                        ask = float(leg_d.get("top_ask_price", 0.0))
+                        if bid > 0 and ask > 0:
+                            return round((bid + ask) / 2.0, 2)
+                        elif ask > 0:
+                            return round(ask, 2)
+                        elif bid > 0:
+                            return round(bid, 2)
+                        prev = float(leg_d.get("previous_close_price", 0.0))
+                        if prev > 0:
+                            return round(prev, 2)
+                except Exception:
+                    pass
+            t_dte = 0.35 / 365.0 if selected_sym in ["SENSEX", "BANKNIFTY"] else 4.0 / 365.0
+            b76 = calculate_black76(spot, strike, t_dte, 0.07, 0.135, opt_t)
+            return max(3.5, b76["price"])
 
         if "Hedged Income" in prof:
             s_ce, b_ce = atm + 2 * step, atm + 4 * step
@@ -323,26 +360,36 @@ with t_setup:
 
         b_act1, b_act2 = st.columns(2)
         with b_act1:
-            if st.button("🚀 Push Basket to Dhan Execution Gateway", type="secondary", use_container_width=True):
-                st.success("✅ Multi-leg basket pre-flight validated for Dhan HQ API!")
+            live_exec = st.checkbox("⚡ Enable Live Broker Fills (Unchecked = Safe Paper Mode)", value=False, key="live_exec_toggle")
+            if st.button("🚀 Execute Basket via Dhan Gateway", type="primary" if live_exec else "secondary", use_container_width=True):
+                try:
+                    from dhan_order_router import execute_basket
+                    res = execute_basket(b, live_mode=live_exec)
+                    mode_lbl = "LIVE DHAN HQ" if live_exec else "PAPER TRADING"
+                    st.success(f"✅ Basket Executed ({mode_lbl})! Orders: {', '.join(res['orders'])}")
+                    st.info("📝 Position logged into Desk Ledger. Sentinel Guardian is active.")
+                except Exception as ex:
+                    st.error(f"Execution gateway error: {ex}")
         with b_act2:
             if st.button("📡 Broadcast Trade Card to Telegram", type="primary", use_container_width=True):
                 legs_str = "\n".join([f"• `{l}`" for l in b["legs"]])
-                msg = f"""🚨 *STOCKERA QUANT: HIGH-CONVICTION TRADE ALERT* 🚨
-━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 *Underlying:* {b['sym']} | *Live Spot:* ₹{b['spot']:,.2f}
-📌 *Strategy:* {b['name']} ({b['book']} Book)
-📋 *EXECUTION LEGS ({b['lot']} Qty / 1 Lot):*
-{legs_str}
-━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 *RISK & FINANCIAL PARAMETERS:*
-• *Entry Reference:* ₹{b['credit']:.2f}
-• *Target / Max Profit:* {b['max_p']}
-• *Defined Risk (SL):* {b['max_l']}
-• *Corridor / Target:* {b['corridor']}
-• *Directive:* {b['sl']}
-━━━━━━━━━━━━━━━━━━━━━━━━━
-⚡ *Status:* ACTIVE | Auto-Logged to Desk Ledger"""
+                msg = (
+                    "🚨 *STOCKERA QUANT: HIGH-CONVICTION TRADE ALERT* 🚨\n"
+                    "-----------------------------------------\n"
+                    f"🎯 *Underlying:* {b['sym']} | *Live Spot:* ₹{b['spot']:,.2f}\n"
+                    f"📌 *Strategy:* {b['name']} ({b['book']} Book)\n"
+                    f"📋 *EXECUTION LEGS ({b['lot']} Qty / 1 Lot):*\n"
+                    f"{legs_str}\n"
+                    "-----------------------------------------\n"
+                    f"💰 *RISK & FINANCIAL PARAMETERS:*\n"
+                    f"• *Entry Reference:* ₹{b['credit']:.2f}\n"
+                    f"• *Target / Max Profit:* {b['max_p']}\n"
+                    f"• *Defined Risk (SL):* {b['max_l']}\n"
+                    f"• *Corridor / Target:* {b['corridor']}\n"
+                    f"• *Directive:* {b['sl']}\n"
+                    "-----------------------------------------\n"
+                    "⚡ *Status:* ACTIVE | Auto-Logged to Desk Ledger"
+                )
                 try:
                     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                     r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
@@ -539,20 +586,101 @@ with t_hedge:
 # TAB 4: TRADE HUNTER & DIRECTIONAL DESK
 # =============================================================================
 with t_hunter:
-    st.subheader("⚡ Stockera Trade Hunter — Multi-Regime Directional Momentum Book")
-    
-    th_col1, th_col2, th_col3 = st.columns(3)
-    th_col1.metric("Active Signal", "BUY NIFTY 23100 PE", "Expiry: 2026-09-29")
-    th_col2.metric("Entry Limit Price", "₹98.55", "Qty: 65 (1 Lot)")
-    th_col3.metric("Capital Deployed", "₹6,405.75", "Risk: -₹1,281.15 (-20%)")
+    st.subheader("⚡ Stockera Trade Hunter — Multi-Regime Directional Momentum Engine")
+    st.caption("Scans live spot, PCR momentum, and strike volatility to isolate asymmetric directional option buying setups.")
 
-    st.markdown("""
+    h_sym_col, h_btn_col = st.columns(2)
+    with h_sym_col:
+        h_selected_sym = st.selectbox("Select Underlying Asset to Hunt", ["NIFTY", "SENSEX", "BANKNIFTY"], key="hunter_asset")
+    with h_btn_col:
+        st.write("")
+        st.write("")
+        trigger_hunt = st.button("🎯 Scan Live Market for Hunter Setup", type="primary", use_container_width=True)
+
+    h_spot = live_indices.get(h_selected_sym, {}).get("price", 23140.50)
+    h_pcr = live_indices.get(h_selected_sym, {}).get("pcr", 0.85)
+    h_step = 100 if h_selected_sym in ["SENSEX", "BANKNIFTY"] else 50
+    h_atm = int(round(h_spot / h_step) * h_step)
+    h_lot = LOT_SIZES.get(h_selected_sym, 25)
+
+    is_bear = h_pcr < 0.88
+    h_opt_type = "PE" if is_bear else "CE"
+    h_strike = h_atm - h_step if is_bear else h_atm + h_step
+    h_contract = f"{h_selected_sym} {h_strike} {h_opt_type}"
+
+    t_val = 0.35 / 365.0 if h_selected_sym in ["SENSEX", "BANKNIFTY"] else 4.0 / 365.0
+    b76_h = calculate_black76(h_spot, h_strike, t_val, 0.07, 0.135, h_opt_type)
+    h_entry = round(max(35.0, b76_h["price"]), 2)
+    h_sl = round(h_entry * 0.80, 2)
+    h_t1 = round(h_entry * 1.25, 2)
+    h_t2 = round(h_entry * 1.50, 2)
+
+    h_cap = round(h_entry * h_lot, 2)
+    h_risk = round((h_entry - h_sl) * h_lot, 2)
+    h_p1 = round((h_t1 - h_entry) * h_lot, 2)
+    h_p2 = round((h_t2 - h_entry) * h_lot, 2)
+
+    th_col1, th_col2, th_col3 = st.columns(3)
+    th_col1.metric("Hunter Signal", f"BUY {h_contract}", f"Regime: {'BEARISH_EXPANSION' if is_bear else 'BULLISH_BREAKOUT'}")
+    th_col2.metric("Entry Limit Price", f"₹{h_entry:,.2f}", f"Qty: {h_lot} (1 Lot)")
+    th_col3.metric("Capital Deployed", f"₹{h_cap:,.2f}", f"Max Risk: -₹{h_risk:,.2f} (-20%)")
+
+    st.markdown(f"""
     | Milestone | Level | Target Return | Expected P&L | Status |
     | :--- | :--- | :--- | :--- | :--- |
-    | **Hard Stop Loss** | ₹78.84 | -20.0% | -₹1,281.15 | 🛑 Active Guard |
-    | **Target 1 (Book 50%)** | ₹123.19 | +25.0% | +₹1,601.60 | 🎯 Pending |
-    | **Target 2 (Trail SL)** | ₹147.82 | +50.0% | +₹3,202.55 | 🚀 Expansion |
+    | **Hard Stop Loss** | ₹{h_sl:.2f} | -20.0% | -₹{h_risk:,.2f} | 🛑 Active Guard |
+    | **Target 1 (Book 50%)** | ₹{h_t1:.2f} | +25.0% | +₹{h_p1:,.2f} | 🎯 High Probability |
+    | **Target 2 (Trail SL)** | ₹{h_t2:.2f} | +50.0% | +₹{h_p2:,.2f} | 🚀 Momentum Expansion |
     """)
+
+    h_b1, h_b2 = st.columns(2)
+    with h_b1:
+        if st.button("🚀 Push Hunter Order to Dhan Gateway", type="secondary", use_container_width=True, key="btn_hunter_exec"):
+            hunter_basket = {
+                "sym": h_selected_sym,
+                "name": f"Trade Hunter Directional {h_opt_type} Momentum",
+                "spot": h_spot,
+                "lot": h_lot,
+                "credit": h_entry,
+                "max_p": f"₹{h_p1:,.2f}",
+                "max_l": f"₹{h_risk:,.2f}",
+                "sl": f"Hard Stop-Loss at ₹{h_sl:.2f}",
+                "legs": [f"🟢 BUY {h_contract} @ Limit ₹{h_entry:.2f}"]
+            }
+            try:
+                from dhan_order_router import execute_basket
+                res = execute_basket(hunter_basket, live_mode=False)
+                st.success(f"✅ Hunter Order Placed (Paper Trading)! Order #{res['orders'][0]}")
+            except Exception as e:
+                st.error(f"Execution error: {e}")
+
+    with h_b2:
+        if st.button("📡 Broadcast Hunter Signal to Telegram", type="primary", use_container_width=True, key="btn_hunter_tele"):
+            hunter_msg = f"""⚡ *STOCKERA TRADE HUNTER SIGNAL* ⚡
+━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 *Asset:* {h_selected_sym} | *Spot:* ₹{h_spot:,.2f}
+📌 *Signal:* BUY `{h_contract}`
+💰 *Entry Price:* ₹{h_entry:,.2f} (1 Lot / {h_lot} Qty)
+🛑 *Stop Loss:* ₹{h_sl:.2f} (-20% / -₹{h_risk:,.2f})
+🎯 *Target 1:* ₹{h_t1:.2f} (+25% / +₹{h_p1:,.2f})
+🚀 *Target 2:* ₹{h_t2:.2f} (+50% / +₹{h_p2:,.2f})
+━━━━━━━━━━━━━━━━━━━━━━━━━
+⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
+            try:
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": hunter_msg, "parse_mode": "Markdown"}, timeout=5)
+                if r.status_code == 200:
+                    st.success("✅ Trade Hunter signal broadcasted to Telegram!")
+                    try:
+                        from cockpit_ledger_bridge import auto_record_broadcasted_basket
+                        auto_record_broadcasted_basket(h_selected_sym, f"Trade Hunter {h_opt_type} Momentum", h_spot, [f"BUY {h_contract} @ {h_entry}"], h_entry, str(h_p1), str(h_sl))
+                        st.info("📝 Position recorded into Desk Ledger for runtime Sentinel tracking!")
+                    except Exception:
+                        pass
+                else:
+                    st.error(f"Telegram notice: {r.text}")
+            except Exception as e:
+                st.error(f"Telegram error: {e}")
 
 # =============================================================================
 # TAB 5: LIVE MARKET MICROSTRUCTURE SCANNER

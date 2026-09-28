@@ -39,7 +39,7 @@ def save_cooldown_state(state):
 def get_strike_ltp(oc, strike: float, opt_type: str) -> float:
     for k, v in oc.items():
         try:
-            if abs(float(k) - strike) < 0.1:
+            if abs(float(k) - strike) < 0.5:
                 p = float(v.get(opt_type.lower(), {}).get("last_price", 0.0))
                 if p > 0: return round(p, 2)
         except Exception:
