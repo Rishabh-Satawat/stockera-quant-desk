@@ -511,3 +511,91 @@ class TestDBPersistence:
             assert row[2] == 49428
         finally:
             os.unlink(db)
+
+
+# ---------------------------------------------------------------------------
+# Staleness gate tests (Phase 1A.2)
+# ---------------------------------------------------------------------------
+
+class TestStalenessGate:
+    """get_latest_chain_snapshot must reject stale or cross-day snapshots."""
+
+    def _make_snapshot_db(self, ts_ist_str: str) -> str:
+        """Create a temp DB with a single NIFTY snapshot at the given IST ISO timestamp."""
+        db = _tmp_db()
+        init_db(db)
+        conn = get_connection(db)
+        _insert_snapshot(
+            conn, "NIFTY", "2026-10-06", 22500, "CE",
+            ts_ist_str, 150.0, 5000,
+            iv=12.5, security_id=40697,
+        )
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_A_stale_4h_snapshot_returns_empty(self):
+        """Test A: A 4-hour-old snapshot returns {} → hunter blocks with DATA_FAULT."""
+        from chain_snapshotter import get_latest_chain_snapshot
+
+        # Freeze "now" to 14:00 IST today; snapshot is at 10:00 IST (4 hours old)
+        fake_now = datetime.datetime(2026, 10, 6, 14, 0, 0, tzinfo=_IST)
+        snap_ts = "2026-10-06T10:00:00+05:30"
+        db = self._make_snapshot_db(snap_ts)
+        try:
+            with patch("chain_snapshotter.datetime") as mock_dt:
+                mock_dt.datetime.now.return_value = fake_now
+                mock_dt.datetime.fromisoformat = datetime.datetime.fromisoformat
+                result = get_latest_chain_snapshot("NIFTY", db, max_age_seconds=90)
+            assert result == {}
+        finally:
+            os.unlink(db)
+
+    def test_B_yesterday_snapshot_returns_empty(self):
+        """Test B: A snapshot from yesterday is rejected and returns {}."""
+        from chain_snapshotter import get_latest_chain_snapshot
+
+        # "now" is today 09:20 IST; snapshot is from yesterday 14:00 IST
+        fake_now = datetime.datetime(2026, 10, 6, 9, 20, 0, tzinfo=_IST)
+        snap_ts = "2026-10-05T14:00:00+05:30"  # yesterday
+        db = self._make_snapshot_db(snap_ts)
+        try:
+            with patch("chain_snapshotter.datetime") as mock_dt:
+                mock_dt.datetime.now.return_value = fake_now
+                mock_dt.datetime.fromisoformat = datetime.datetime.fromisoformat
+                result = get_latest_chain_snapshot("NIFTY", db, max_age_seconds=90)
+            assert result == {}
+        finally:
+            os.unlink(db)
+
+    def test_C_fresh_snapshot_returns_data_with_age(self):
+        """Test C: A fresh snapshot (age ≤ 30s) returns full data with snapshot_age_seconds."""
+        from chain_snapshotter import get_latest_chain_snapshot
+
+        # "now" is 09:16:20 IST; snapshot at 09:16:00 IST — 20s old
+        fake_now = datetime.datetime(2026, 10, 6, 9, 16, 20, tzinfo=_IST)
+        snap_ts = "2026-10-06T09:16:00+05:30"
+        db = self._make_snapshot_db(snap_ts)
+        try:
+            with patch("chain_snapshotter.datetime") as mock_dt:
+                mock_dt.datetime.now.return_value = fake_now
+                mock_dt.datetime.fromisoformat = datetime.datetime.fromisoformat
+                result = get_latest_chain_snapshot("NIFTY", db, max_age_seconds=90)
+            assert result != {}
+            assert "oc" in result
+            assert "snapshot_age_seconds" in result
+            assert result["snapshot_age_seconds"] <= 30.0
+        finally:
+            os.unlink(db)
+
+    def test_D_empty_db_returns_empty(self):
+        """Test D: An empty DB returns {}."""
+        from chain_snapshotter import get_latest_chain_snapshot
+
+        db = _tmp_db()
+        init_db(db)
+        try:
+            result = get_latest_chain_snapshot("NIFTY", db, max_age_seconds=90)
+            assert result == {}
+        finally:
+            os.unlink(db)

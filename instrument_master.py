@@ -13,6 +13,7 @@ Actual CSV header:
 import os
 import csv
 import datetime
+from datetime import timezone
 import threading
 import requests
 from typing import Optional
@@ -56,7 +57,7 @@ def _load_from_cache() -> list[dict]:
 def _ensure_loaded(force: bool = False) -> list[dict]:
     global _loaded_rows, _loaded_at
     with _lock:
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(timezone.utc)
         stale = _loaded_at is None or (now - _loaded_at).total_seconds() > _CACHE_TTL_HOURS * 3600
 
         if not force and not stale and _loaded_rows:
