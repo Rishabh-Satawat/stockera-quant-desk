@@ -8,34 +8,29 @@ DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "").strip()
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
 
 def get_live_spots():
-    spots = {"NIFTY": 0.0, "BANKNIFTY": 0.0, "SENSEX": 0.0}
+    spots = {"NIFTY": 0.0, "BANKNIFTY": 0.0, "FINNIFTY": 0.0, "SENSEX": 0.0}
 
-    # Tier 1: Dhan HQ v2 Marketfeed with correct NSE & BSE segments
+    # Tier 1: Dhan HQ v2 Marketfeed — IDX_I segment covers all four indices
+    # security_ids: NIFTY=13, BANKNIFTY=25, FINNIFTY=27, SENSEX=51
     if DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID:
         try:
             h = {"access-token": DHAN_ACCESS_TOKEN, "client-id": DHAN_CLIENT_ID, "Content-Type": "application/json"}
-            payload = {"NSE_IDX": [13, 25], "BSE_IDX": [51]}
+            payload = {"IDX_I": [13, 25, 27, 51]}
             r = requests.post("https://api.dhan.co/v2/marketfeed/ltp", headers=h, json=payload, timeout=3)
             if r.status_code == 200:
                 data = r.json().get("data", {})
-                nse = data.get("NSE_IDX", {})
-                bse = data.get("BSE_IDX", {})
+                idx = data.get("IDX_I", {})
 
-                n_val = nse.get("13") or nse.get(13) or {}
-                if "last_price" in n_val and float(n_val["last_price"]) > 0:
-                    spots["NIFTY"] = round(float(n_val["last_price"]), 2)
-
-                bn_val = nse.get("25") or nse.get(25) or {}
-                if "last_price" in bn_val and float(bn_val["last_price"]) > 0:
-                    spots["BANKNIFTY"] = round(float(bn_val["last_price"]), 2)
-
-                sx_val = bse.get("51") or bse.get(51) or {}
-                if "last_price" in sx_val and float(sx_val["last_price"]) > 0:
-                    spots["SENSEX"] = round(float(sx_val["last_price"]), 2)
+                _id_to_sym = {13: "NIFTY", 25: "BANKNIFTY", 27: "FINNIFTY", 51: "SENSEX"}
+                for sec_id, sym in _id_to_sym.items():
+                    val = idx.get(str(sec_id)) or idx.get(sec_id) or {}
+                    if "last_price" in val and float(val["last_price"]) > 0:
+                        spots[sym] = round(float(val["last_price"]), 2)
         except Exception:
             pass
 
     # Tier 2: Yahoo Finance Live API (Universal, Fast, No Auth Required)
+    # FINNIFTY has no Yahoo Finance ticker; it remains 0.0 if Dhan fails.
     yf_map = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN"}
     for sym, ticker in yf_map.items():
         if spots[sym] <= 0:
