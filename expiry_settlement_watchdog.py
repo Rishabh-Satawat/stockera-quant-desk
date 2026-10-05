@@ -12,12 +12,16 @@ logger = logging.getLogger(__name__)
 # 1. Load Secrets
 load_dotenv(r"C:\kite-agent\secrets\telegram.env")
 load_dotenv(r"C:\kite-agent\secrets\dhan.env")
-_tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-_tg_chat = os.getenv("TELEGRAM_CHAT_ID", "")
-if not _tg_token:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before running the watchdog")
-TELEGRAM_BOT_TOKEN = _tg_token
-TELEGRAM_CHAT_ID = _tg_chat
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+def _require_telegram_token():
+    """Raise at call time if the token is absent — never at import time."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before running the watchdog"
+        )
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
 
@@ -113,7 +117,13 @@ def run_settlement_watchdog(dry_run=False):
     with open(LEDGER_PATH, "r", encoding="utf-8") as f:
         trades = json.load(f)
 
-    active_trades = [t for t in trades if str(t.get("status", "")).upper() == "ACTIVE"]
+    # P0.13: Process ACTIVE trades AND UNRESOLVED trades that carry data_fault=True;
+    # a sentinel-escalated UNRESOLVED trade still has open exposure at 15:20 IST.
+    active_trades = [
+        t for t in trades
+        if str(t.get("status", "")).upper() == "ACTIVE"
+        or (str(t.get("status", "")).upper() == "UNRESOLVED" and t.get("data_fault") is True)
+    ]
 
     print("=" * 60)
     print(f"🛡️ STOCKERA 15:20 IST EXPIRY SETTLEMENT WATCHDOG")
@@ -135,13 +145,19 @@ def run_settlement_watchdog(dry_run=False):
 
         if is_synthetic or spot is None:
             logger.error(
-                "DATA_FAULT run_settlement_watchdog sym=%s live_spot_unavailable is_synthetic=True", symbol
+                "DATA_FAULT run_settlement_watchdog sym=%s live_spot_unavailable trade_id=%s",
+                symbol, t.get("trade_id", "TRD")
             )
             print(f"⚠️ [{t.get('trade_id', 'TRD')}] DATA_FAULT: live spot unavailable for {symbol}. "
-                  f"Skipping STT assessment — manual review required.")
-            # Tag the trade so downstream tools know the exit was assessed without live data
+                  f"Logging as UNRESOLVED_DATA_FAULT — manual broker reconciliation required.")
+            # P0.13: No fabricated exit prices. Tag for manual reconciliation.
             if not dry_run:
-                t["is_synthetic"] = True
+                t["status"] = "UNRESOLVED_DATA_FAULT"
+                t["exit_time"] = "15:20:00"
+                t["exit_price"] = None
+                t["exit_reason"] = "UNRESOLVED_DATA_FAULT — manual broker reconciliation required"
+                t["data_fault"] = True
+                squared_count += 1
             continue
 
         tag, intrinsic, stt = evaluate_stt_hazard(t, spot)
@@ -155,10 +171,13 @@ def run_settlement_watchdog(dry_run=False):
         if tag == "ITM_HAZARD":
             warnings.append(f"⚠️ <b>STT TRAP ALERT:</b> {trade_id} ({contract}) is ITM! Est Notional STT: ₹{stt:,.1f}")
 
-        # Square off the leg
+        # Square off the leg using live intrinsic value — no synthetic exit prices.
         if not dry_run:
-            entry = float(t.get("entry_price", 100))
-            exit_p = round(max(0.5, intrinsic if intrinsic > 0 else entry * 0.1), 2)
+            if intrinsic > 0:
+                exit_p = round(intrinsic, 2)
+            else:
+                # OTM at expiry: option expires worthless; LTP near 0 — record as 0.0
+                exit_p = 0.0
             t["status"] = "CLOSED"
             t["exit_time"] = "15:20:00"
             t["exit_price"] = exit_p
@@ -172,6 +191,7 @@ def run_settlement_watchdog(dry_run=False):
         print(f"\n✅ {squared_count} legs auto-squared off to eliminate settlement risk.")
 
         if warnings:
+            _require_telegram_token()
             alert_text = (
                 "<b>🚨 EXPIRY STT DEFENSE INTERVENTION 🚨</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"

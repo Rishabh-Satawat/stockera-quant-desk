@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 
 # 1. Load Secrets
 load_dotenv(r"C:\kite-agent\secrets\telegram.env")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8814895777:AAFrGfSdIM1fW7HeHg9yIeFjOXqOMyg9F7s")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1337295028")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 LEDGER_PATH = r"C:\kite-agent\trades_ledger.json"
 
