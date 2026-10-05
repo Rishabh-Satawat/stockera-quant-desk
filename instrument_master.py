@@ -3,6 +3,11 @@ near-month futures security_id and lot size for NIFTY, BANKNIFTY, FINNIFTY, SENS
 
 Source: https://images.dhan.co/api-data/api-scrip-master-detailed.csv
 Cached to data/scrip_master_cache.csv and refreshed when older than 6 hours.
+
+Actual CSV header:
+  EXCH_ID,SEGMENT,SECURITY_ID,ISIN,INSTRUMENT,UNDERLYING_SECURITY_ID,
+  UNDERLYING_SYMBOL,SYMBOL_NAME,DISPLAY_NAME,INSTRUMENT_TYPE,SERIES,
+  LOT_SIZE,SM_EXPIRY_DATE,...
 """
 
 import os
@@ -17,11 +22,12 @@ _SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.c
 _CACHE_PATH = Path(__file__).parent / "data" / "scrip_master_cache.csv"
 _CACHE_TTL_HOURS = 6
 
-_INDEX_NAMES = {
-    "NIFTY": ["NIFTY", "NIFTY 50"],
-    "BANKNIFTY": ["BANKNIFTY", "NIFTY BANK"],
-    "FINNIFTY": ["FINNIFTY", "NIFTY FIN SERVICE"],
-    "SENSEX": ["SENSEX", "BSE SENSEX"],
+# EXCH_ID for each symbol
+_EXCH_ID = {
+    "NIFTY": "NSE",
+    "BANKNIFTY": "NSE",
+    "FINNIFTY": "NSE",
+    "SENSEX": "BSE",
 }
 
 _lock = threading.Lock()
@@ -56,7 +62,6 @@ def _ensure_loaded(force: bool = False) -> list[dict]:
         if not force and not stale and _loaded_rows:
             return _loaded_rows
 
-        # Try fresh download first; fall back to cache on network failure
         try:
             rows = _download_csv()
         except Exception:
@@ -70,62 +75,56 @@ def _ensure_loaded(force: bool = False) -> list[dict]:
         return rows
 
 
-def _futidx_rows() -> list[dict]:
+def _futidx_candidates(symbol: str) -> list[dict]:
+    """Return FUTIDX rows matching the given canonical symbol."""
     rows = _ensure_loaded()
-    return [r for r in rows if r.get("INSTRUMENT", "").strip().upper() == "FUTIDX"]
+    exch = _EXCH_ID.get(symbol.upper(), "NSE")
+    today = datetime.date.today().isoformat()  # YYYY-MM-DD
 
+    candidates = []
+    for r in rows:
+        if r.get("INSTRUMENT", "").strip().upper() != "FUTIDX":
+            continue
+        if r.get("EXCH_ID", "").strip().upper() != exch:
+            continue
+        if r.get("UNDERLYING_SYMBOL", "").strip().upper() != symbol.upper():
+            continue
+        expiry = r.get("SM_EXPIRY_DATE", "").strip()
+        if not expiry:
+            continue
+        if expiry >= today:
+            candidates.append(r)
 
-def _match_symbol(canonical: str, row_symbol: str) -> bool:
-    row_sym = row_symbol.strip().upper()
-    for alias in _INDEX_NAMES.get(canonical, [canonical]):
-        if alias.upper() == row_sym:
-            return True
-    return False
+    # Sort by expiry date ascending so index 0 is near-month
+    candidates.sort(key=lambda r: r.get("SM_EXPIRY_DATE", "9999-12-31").strip())
+    return candidates
 
 
 def get_near_month_security_id(symbol: str) -> int:
     """Return the near-month FUTIDX security_id for the given index.
 
-    Near-month = the row with the earliest expiry date among FUTIDX rows
-    for this symbol. Raises RuntimeError if not found.
+    Raises RuntimeError if not found.
     """
-    fut_rows = _futidx_rows()
-    candidates = [r for r in fut_rows if _match_symbol(symbol, r.get("DISPLAY_NAME", "") or r.get("CUSTOM_SYMBOL", "") or r.get("SYMBOL", ""))]
-
+    candidates = _futidx_candidates(symbol)
     if not candidates:
         raise RuntimeError(f"No FUTIDX rows found for symbol {symbol!r}")
-
-    # Sort by expiry date string (YYYY-MM-DD sorts lexicographically)
-    def expiry_key(r: dict) -> str:
-        # Try EXPIRY_DATE column; fall back to EXPIRY
-        return r.get("EXPIRY_DATE", r.get("EXPIRY", "9999-12-31")).strip()
-
-    candidates.sort(key=expiry_key)
     near = candidates[0]
-    sid = near.get("SEM_SMST_SECURITY_ID") or near.get("SECURITY_ID") or near.get("SM_SECURITY_ID")
+    sid = near.get("SECURITY_ID")
     if not sid:
-        raise RuntimeError(f"security_id column not found in row for {symbol}: {near}")
+        raise RuntimeError(f"SECURITY_ID column not found in row for {symbol}: {near}")
     return int(str(sid).strip())
 
 
 def get_lot_size(symbol: str) -> int:
-    """Return official lot size for the given index from FUTIDX rows.
+    """Return official lot size for the given index from near-month FUTIDX row.
 
     Raises RuntimeError if not found.
     """
-    fut_rows = _futidx_rows()
-    candidates = [r for r in fut_rows if _match_symbol(symbol, r.get("DISPLAY_NAME", "") or r.get("CUSTOM_SYMBOL", "") or r.get("SYMBOL", ""))]
-
+    candidates = _futidx_candidates(symbol)
     if not candidates:
         raise RuntimeError(f"No FUTIDX rows found for symbol {symbol!r}")
-
-    # All near-month rows should share the same lot size
-    lot_col = None
-    for col_name in ("LOT_SIZE", "SM_LOT_SIZE", "LOTSIZE"):
-        if col_name in candidates[0]:
-            lot_col = col_name
-            break
-    if not lot_col:
-        raise RuntimeError(f"Lot size column not found in row for {symbol}: {candidates[0]}")
-
-    return int(str(candidates[0][lot_col]).strip())
+    near = candidates[0]
+    lot = near.get("LOT_SIZE")
+    if not lot:
+        raise RuntimeError(f"LOT_SIZE column not found in row for {symbol}: {near}")
+    return int(str(lot).strip())
