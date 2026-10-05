@@ -9,8 +9,8 @@ LEDGER_FILE = r"C:\kite-agent\trades_ledger.json"
 HISTORY_CSV = r"C:\kite-agent\trades_history.csv"
 
 load_dotenv(r"C:\kite-agent\secrets\telegram.env")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8814895777:AAFrGfSdIM1fW7HeHg9yIeFjOXqOMyg9F7s").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1337295028").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 def send_telegram(msg: str):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
