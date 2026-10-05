@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from chain_microstructure_analyzer import analyze_option_chain_microstructure
 from market_hours_gate import is_market_open  # P0.1
 from regime_engine import compute_regime, get_playbook
+from playbook_triggers import evaluate_all_playbooks, PlaybookSignal
+from scoring_engine import score_candidate, rank_and_filter, format_confluence_breakdown, TIER1_THRESHOLD
 from db_init import DEFAULT_DB_PATH
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -110,70 +112,6 @@ def hunt_market_once():
 
     print(f"\n[{now_str}] 📡 DUAL-BOOK SCAN | Hedged: {len(hedged_trades)}/3 | Naked: {len(naked_trades)}/3")
 
-    # P0.2: Evaluate all 4 underlyings into a candidate list — no early break.
-    candidates = []
-
-    for sym in ["NIFTY", "SENSEX", "BANKNIFTY", "FINNIFTY"]:
-        analysis = analyze_option_chain_microstructure(sym)
-        if not analysis:
-            logger.error("DATA_FAULT hunt_market_once sym=%s no_analysis", sym)
-            print(f"   ⚠️ {sym:<10} | Could not reach Dhan chain feed.")
-            continue
-
-        # P0.3: Fail closed on synthetic data — never alert or trade on fallback.
-        if analysis.get("is_synthetic", False):
-            logger.error("DATA_FAULT hunt_market_once sym=%s is_synthetic=True refusing alert", sym)
-            print(f"   🚫 {sym:<10} | DATA_FAULT: synthetic feed — skipping.")
-            continue
-
-        spot = analysis["spot"]
-        pcr = analysis["pcr_oi"]
-        max_pain = analysis["max_pain"]
-        call_wall = analysis["call_wall"]
-        put_wall = analysis["put_wall"]
-        oc = analysis["raw_oc"]
-        expiry = analysis["expiry"]
-
-        lot = LOT_SIZES.get(sym)
-        if lot is None:
-            logger.error("DATA_FAULT hunt_market_once sym=%s unknown_lot_size", sym)
-            continue
-
-        step = 100 if sym in ["SENSEX", "BANKNIFTY"] else 50
-        atm = int(round(spot / step) * step)
-
-        last_t = cooldowns.get(sym, 0)
-        cooldown_rem = max(0, int((900 - (time.time() - last_t)) / 60))
-
-        # Regime classification
-        if pcr < 0.85:
-            regime = "BEARISH_EXPANSION"
-        elif pcr > 1.15:
-            regime = "BULLISH_EXPANSION"
-        else:
-            regime = "RANGE_BOUND"
-
-        print(f"   • {sym:<10} | Spot: ₹{spot:,.2f} | PCR: {pcr:.2f} ({regime}) | MaxPain: {max_pain:.0f} | Cooldown: {cooldown_rem}m")
-
-        if cooldown_rem > 0:
-            continue
-
-        candidates.append({
-            "sym": sym, "spot": spot, "pcr": pcr, "max_pain": max_pain,
-            "call_wall": call_wall, "put_wall": put_wall, "oc": oc,
-            "expiry": expiry, "lot": lot, "step": step, "atm": atm,
-            "regime": regime,
-        })
-
-    # P0.2: Full scan complete — first-match selection (not scored ranking; Phase 3 will add scoring).
-    naked_candidate = None
-    hedged_candidate = None
-    for c in candidates:
-        if c["regime"] in ("BEARISH_EXPANSION", "BULLISH_EXPANSION") and naked_candidate is None:
-            naked_candidate = c
-        if c["regime"] == "RANGE_BOUND" and hedged_candidate is None:
-            hedged_candidate = c
-
     # ──────────────────────────────────────────────────────────────────────────
     # Regime gate: consult regime_engine before emitting any signal.
     # A playbook not permitted in the current regime is blocked and logged.
@@ -184,11 +122,7 @@ def hunt_market_once():
     _RANGE_PLAYBOOKS = {"IRON_CONDOR", "SHORT_STRANGLE"}
 
     def _check_regime_gate(candidate, required_playbooks, db_path=DEFAULT_DB_PATH):
-        """Return (allowed: bool, regime_dict, playbook: str).
-
-        Computes the live regime for the candidate and checks whether the
-        candidate's intended playbook family is permitted.
-        """
+        """Return (allowed: bool, regime_dict, playbook: str)."""
         try:
             reg = compute_regime(
                 candidate["sym"],
@@ -205,228 +139,273 @@ def hunt_market_once():
             return True, reg, playbook
         return False, reg, playbook
 
-    # --- A. NAKED DIRECTIONAL BOOK ---
-    if naked_candidate and len(naked_trades) < 3:
-        c = naked_candidate
-        sym, spot, pcr = c["sym"], c["spot"], c["pcr"]
-        oc, expiry, lot, step, atm = c["oc"], c["expiry"], c["lot"], c["step"], c["atm"]
-        regime = c["regime"]
-        max_pain, call_wall, put_wall = c["max_pain"], c["call_wall"], c["put_wall"]
+    # ──────────────────────────────────────────────────────────────────────────
+    # P1C: Full playbook + scoring pipeline across all 4 indices.
+    # Replaces legacy PCR if/else with evaluate_all_playbooks + score_candidate.
+    # ──────────────────────────────────────────────────────────────────────────
 
-        if regime == "BEARISH_EXPANSION":
-            # Regime gate: block if the vol-adjusted playbook is not bearish.
-            allowed, reg_data, playbook = _check_regime_gate(c, _BEARISH_PLAYBOOKS)
-            if not allowed:
-                reason = (
-                    f"{reg_data.get('direction_label','?')} / "
-                    f"{reg_data.get('vol_regime','?')} / {playbook}"
-                )
-                logger.info(
-                    "REGIME_GATED: sym=%s book=NAKED reason=%s playbook=%s",
-                    sym, reason, playbook,
-                )
-                print(f"   🚦 {sym} NAKED PE: REGIME_GATED ({reason}) — signal suppressed.")
-            else:
-                regime_line = (
-                    f"Regime: {reg_data.get('direction_label','?')} / "
-                    f"{reg_data.get('vol_regime','?')} / {playbook}"
-                )
-                strike = atm
-                opt_price = get_strike_ltp(oc, strike, "PE")
-                # P0.5: Abort on missing price — never trade blind.
-                if opt_price is None:
-                    logger.error("DATA_FAULT hunt_market_once sym=%s BEARISH_EXPANSION PE ltp=None aborting", sym)
-                    print(f"   🚫 {sym} NAKED PE: DATA_FAULT ltp unavailable — trade aborted.")
-                else:
-                    sl = round(opt_price * 0.80, 2)
-                    t1 = round(opt_price * 1.25, 2)
-                    t2 = round(opt_price * 1.50, 2)
-                    trade_id = f"{today_tag}-NAKED-{len(naked_trades)+1:02d}"
-                    contract = f"{sym} {strike} PE"
-                    new_trade = {
-                        "trade_id": trade_id, "book": "NAKED", "symbol": sym,
-                        "contract": contract, "action": "BUY",
-                        "strategy": "Bearish Put Momentum (Downside Expansion)",
-                        "qty": lot, "entry_time": now_str, "entry_price": opt_price,
-                        "stop_loss": sl, "target_1": t1, "target_2": t2,
-                        "status": "ACTIVE", "exit_time": None, "exit_price": None,
-                        "exit_reason": None, "margin_deployed": round(opt_price * lot, 2)
-                    }
-                    trades.append(new_trade)
-                    _write_ledger(trades, LEDGER_FILE)
-                    cooldowns[sym] = time.time()
-                    save_cooldown_state(cooldowns)
-                    msg = f"""🚨 *STOCKERA QUANT: NAKED DIRECTIONAL BUY ALERT* 🚨
-━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
-📅 *Expiry:* `{expiry}` | *Book:* 🔴 NAKED DIRECTIONAL
-📌 *Strategy:* Bearish Put Buying (Downside Momentum)
-━━━━━━━━━━━━━━━━━━━━━━━━━
-🧠 *OPTION CHAIN MICROSTRUCTURE THESIS:*
-• *Put-Call Ratio (PCR):* {pcr:.2f} (Bearish Call Heavy Pressure)
-• *Max Pain Strike:* {max_pain:.0f} (Spot is {max_pain - spot:.1f} pts below)
-• *Call Resistance Wall:* {call_wall:.0f} (Overhead Supply)
-• *Downside Target Wall:* {put_wall:.0f} (Next Major Support)
-━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 *EXACT ORDER TO EXECUTE:*
-• 🟢 `BUY  {contract} @ Limit ₹{opt_price:.2f} ({lot} Qty / 1 Lot)`
+    # Collect raw market data for all 4 underlyings
+    market_data: list[dict] = []
 
-💰 *RISK & REWARD BLUEPRINT:*
-• *Capital Deployed:* ₹{opt_price * lot:,.2f}
-• *Hard Stop-Loss:* ₹{sl:.2f} (-20% / Risk -₹{(opt_price - sl) * lot:,.2f})
-• *Target 1 (Book 50%):* ₹{t1:.2f} (+25% / +₹{(t1 - opt_price) * lot:,.2f}) 🎯
-• *Target 2 (Trail SL):* ₹{t2:.2f} (+50% / +₹{(t2 - opt_price) * lot:,.2f}) 🚀
-• *Realized R:R Ratio:* 1 : 2.50 ✅
-━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 *{regime_line}*
-⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
-                    print(f"\n🚀 DISPATCHING NAKED BEARISH ALERT:\n{msg}\n")
-                    send_telegram_alert(msg)
+    for sym in ["NIFTY", "SENSEX", "BANKNIFTY", "FINNIFTY"]:
+        analysis = analyze_option_chain_microstructure(sym)
+        if not analysis:
+            logger.error("DATA_FAULT hunt_market_once sym=%s no_analysis", sym)
+            print(f"   ⚠️ {sym:<10} | Could not reach Dhan chain feed.")
+            continue
 
-        elif regime == "BULLISH_EXPANSION":
-            # Regime gate: block if the vol-adjusted playbook is not bullish.
-            allowed, reg_data, playbook = _check_regime_gate(c, _BULLISH_PLAYBOOKS)
-            if not allowed:
-                reason = (
-                    f"{reg_data.get('direction_label','?')} / "
-                    f"{reg_data.get('vol_regime','?')} / {playbook}"
-                )
-                logger.info(
-                    "REGIME_GATED: sym=%s book=NAKED reason=%s playbook=%s",
-                    sym, reason, playbook,
-                )
-                print(f"   🚦 {sym} NAKED CE: REGIME_GATED ({reason}) — signal suppressed.")
-            else:
-                regime_line = (
-                    f"Regime: {reg_data.get('direction_label','?')} / "
-                    f"{reg_data.get('vol_regime','?')} / {playbook}"
-                )
-                strike = atm
-                opt_price = get_strike_ltp(oc, strike, "CE")
-                # P0.5: Abort on missing price — never trade blind.
-                if opt_price is None:
-                    logger.error("DATA_FAULT hunt_market_once sym=%s BULLISH_EXPANSION CE ltp=None aborting", sym)
-                    print(f"   🚫 {sym} NAKED CE: DATA_FAULT ltp unavailable — trade aborted.")
-                else:
-                    sl = round(opt_price * 0.80, 2)
-                    t1 = round(opt_price * 1.25, 2)
-                    t2 = round(opt_price * 1.50, 2)
-                    trade_id = f"{today_tag}-NAKED-{len(naked_trades)+1:02d}"
-                    contract = f"{sym} {strike} CE"
-                    new_trade = {
-                        "trade_id": trade_id, "book": "NAKED", "symbol": sym,
-                        "contract": contract, "action": "BUY",
-                        "strategy": "Bullish Call Momentum (Upside Breakout)",
-                        "qty": lot, "entry_time": now_str, "entry_price": opt_price,
-                        "stop_loss": sl, "target_1": t1, "target_2": t2,
-                        "status": "ACTIVE", "exit_time": None, "exit_price": None,
-                        "exit_reason": None, "margin_deployed": round(opt_price * lot, 2)
-                    }
-                    trades.append(new_trade)
-                    _write_ledger(trades, LEDGER_FILE)
-                    cooldowns[sym] = time.time()
-                    save_cooldown_state(cooldowns)
-                    msg = f"""🚨 *STOCKERA QUANT: NAKED DIRECTIONAL BUY ALERT* 🚨
-━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
-📅 *Expiry:* `{expiry}` | *Book:* 🔴 NAKED DIRECTIONAL
-📌 *Strategy:* Bullish Call Buying (Upside Momentum)
-━━━━━━━━━━━━━━━━━━━━━━━━━
-🧠 *OPTION CHAIN MICROSTRUCTURE THESIS:*
-• *Put-Call Ratio (PCR):* {pcr:.2f} (Strong Put Writing Support)
-• *Max Pain Strike:* {max_pain:.0f} (Spot is {spot - max_pain:.1f} pts above)
-• *Call Wall Breakout:* {call_wall:.0f} (Short Covering Acceleration)
-━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 *EXACT ORDER TO EXECUTE:*
-• 🟢 `BUY  {contract} @ Limit ₹{opt_price:.2f} ({lot} Qty / 1 Lot)`
+        # P0.3: Fail closed on synthetic data.
+        if analysis.get("is_synthetic", False):
+            logger.error("DATA_FAULT hunt_market_once sym=%s is_synthetic=True refusing alert", sym)
+            print(f"   🚫 {sym:<10} | DATA_FAULT: synthetic feed — skipping.")
+            continue
 
-💰 *RISK & REWARD BLUEPRINT:*
-• *Capital Deployed:* ₹{opt_price * lot:,.2f}
-• *Hard Stop-Loss:* ₹{sl:.2f} (-20% / Risk -₹{(opt_price - sl) * lot:,.2f})
-• *Target 1 (Book 50%):* ₹{t1:.2f} (+25% / +₹{(t1 - opt_price) * lot:,.2f}) 🎯
-• *Target 2 (Trail SL):* ₹{t2:.2f} (+50% / +₹{(t2 - opt_price) * lot:,.2f}) 🚀
-• *Realized R:R Ratio:* 1 : 2.50 ✅
-━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 *{regime_line}*
-⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
-                    print(f"\n🚀 DISPATCHING NAKED BULLISH ALERT:\n{msg}\n")
-                    send_telegram_alert(msg)
+        lot = LOT_SIZES.get(sym)
+        if lot is None:
+            logger.error("DATA_FAULT hunt_market_once sym=%s unknown_lot_size", sym)
+            continue
 
-    # --- B. HEDGED RANGE-BOUND BOOK ---
-    if hedged_candidate and len(hedged_trades) < 3:
-        c = hedged_candidate
-        sym, spot, pcr = c["sym"], c["spot"], c["pcr"]
-        oc, expiry, lot, step, atm = c["oc"], c["expiry"], c["lot"], c["step"], c["atm"]
-        max_pain, call_wall, put_wall = c["max_pain"], c["call_wall"], c["put_wall"]
+        step = 100 if sym in ["SENSEX", "BANKNIFTY"] else 50
+        spot = analysis["spot"]
+        pcr = analysis["pcr_oi"]
+        max_pain = analysis["max_pain"]
+        call_wall = analysis["call_wall"]
+        put_wall = analysis["put_wall"]
 
-        # Regime gate: block if the vol-adjusted playbook is not range-bound.
-        allowed, reg_data, playbook = _check_regime_gate(c, _RANGE_PLAYBOOKS)
-        if not allowed:
-            reason = (
-                f"{reg_data.get('direction_label','?')} / "
-                f"{reg_data.get('vol_regime','?')} / {playbook}"
-            )
-            logger.info(
-                "REGIME_GATED: sym=%s book=HEDGED reason=%s playbook=%s",
-                sym, reason, playbook,
-            )
-            print(f"   🚦 {sym} HEDGED CONDOR: REGIME_GATED ({reason}) — signal suppressed.")
-            # Skip the rest of this hedged block
-            hedged_candidate = None
+        last_t = cooldowns.get(sym, 0)
+        cooldown_rem = max(0, int((900 - (time.time() - last_t)) / 60))
 
-    if hedged_candidate and len(hedged_trades) < 3:
-        c = hedged_candidate
-        sym, spot, pcr = c["sym"], c["spot"], c["pcr"]
-        oc, expiry, lot, step, atm = c["oc"], c["expiry"], c["lot"], c["step"], c["atm"]
-        max_pain, call_wall, put_wall = c["max_pain"], c["call_wall"], c["put_wall"]
-        reg_data_h = _check_regime_gate(c, _RANGE_PLAYBOOKS)[1]
-        regime_line_h = (
-            f"Regime: {reg_data_h.get('direction_label','?')} / "
-            f"{reg_data_h.get('vol_regime','?')} / {reg_data_h.get('playbook','?')}"
-        )
-
-        s_ce, b_ce = atm + 2 * step, atm + 4 * step
-        s_pe, b_pe = atm - 2 * step, atm - 4 * step
-
-        p_sce = get_strike_ltp(oc, s_ce, "CE")
-        p_bce = get_strike_ltp(oc, b_ce, "CE")
-        p_spe = get_strike_ltp(oc, s_pe, "PE")
-        p_bpe = get_strike_ltp(oc, b_pe, "PE")
-
-        # P0.5: All 4 legs must have live prices — abort entire condor on any None.
-        if any(p is None for p in [p_sce, p_bce, p_spe, p_bpe]):
-            missing = [n for n, p in [("s_ce", p_sce), ("b_ce", p_bce), ("s_pe", p_spe), ("b_pe", p_bpe)] if p is None]
-            logger.error("DATA_FAULT hunt_market_once sym=%s condor legs=%s ltp=None aborting", sym, missing)
-            print(f"   🚫 {sym} HEDGED CONDOR: DATA_FAULT legs {missing} ltp unavailable — trade aborted.")
+        # Legacy PCR regime label for display
+        if pcr < 0.85:
+            pcr_regime = "BEARISH_EXPANSION"
+        elif pcr > 1.15:
+            pcr_regime = "BULLISH_EXPANSION"
         else:
-            net_credit = round((p_sce - p_bce) + (p_spe - p_bpe), 2)
-            max_profit = round(net_credit * lot, 2)
-            lower_be = s_pe - net_credit
-            upper_be = s_ce + net_credit
+            pcr_regime = "RANGE_BOUND"
 
-            trade_id = f"{today_tag}-HEDGE-{len(hedged_trades)+1:02d}"
-            contract = f"{sym} {s_pe} PE / {s_ce} CE Condor"
+        print(f"   • {sym:<10} | Spot: ₹{spot:,.2f} | PCR: {pcr:.2f} ({pcr_regime}) | MaxPain: {max_pain:.0f} | Cooldown: {cooldown_rem}m")
 
+        if cooldown_rem > 0:
+            continue
+
+        market_data.append({
+            "sym": sym, "analysis": analysis, "lot": lot, "step": step,
+        })
+
+    # For each symbol, compute regime + evaluate playbooks + score
+    all_signals: list[tuple[PlaybookSignal, dict, dict]] = []  # (signal, score_result, meta)
+
+    for md in market_data:
+        sym = md["sym"]
+        analysis = md["analysis"]
+        step = md["step"]
+        lot = md["lot"]
+
+        # Regime gate
+        try:
+            reg_data = compute_regime(sym, analysis["expiry"], analysis["spot"])
+        except Exception as exc:
+            logger.warning("compute_regime failed for %s: %s — skipping", sym, exc)
+            continue
+
+        playbook_name = reg_data.get("playbook", "NO_TRADE")
+        # Check the direction of the legacy PCR regime against the new regime
+        # and emit REGIME_GATED log if there's a conflict.
+        pcr_val = analysis["pcr_oi"]
+        if pcr_val < 0.85 and playbook_name not in _BEARISH_PLAYBOOKS:
+            logger.info(
+                "REGIME_GATED: sym=%s book=NAKED reason=%s/%s/%s playbook=%s",
+                sym, reg_data.get("direction_label"), reg_data.get("vol_regime"), "PCR_BEAR_EXPANSION", playbook_name,
+            )
+        elif pcr_val > 1.15 and playbook_name not in _BULLISH_PLAYBOOKS:
+            logger.info(
+                "REGIME_GATED: sym=%s book=NAKED reason=%s/%s/%s playbook=%s",
+                sym, reg_data.get("direction_label"), reg_data.get("vol_regime"), "PCR_BULL_EXPANSION", playbook_name,
+            )
+
+        # Evaluate all playbooks
+        signals = evaluate_all_playbooks(sym, analysis, reg_data, step)
+
+        for sig in signals:
+            score_result = score_candidate(sig)
+            tier = score_result["tier"]
+
+            if tier == 0:
+                logger.debug(
+                    "scoring: %s %s score=%d < 60 — dropped",
+                    sym, sig.playbook_id, score_result["score"],
+                )
+                continue
+            elif tier == 2:
+                logger.info(
+                    "scoring: %s %s score=%d tier=2 watchlist",
+                    sym, sig.playbook_id, score_result["score"],
+                )
+            # Both tier 1 and tier 2 are collected; we dispatch only tier 1 below
+            all_signals.append((sig, score_result, md))
+
+    # Apply anti-correlation filter and sort by score
+    scored_pairs = [(sig, sr) for sig, sr, _ in all_signals]
+    filtered = rank_and_filter(scored_pairs)
+
+    # Re-associate metadata
+    meta_map = {id(sig): md for sig, sr, md in all_signals}
+    filtered_with_meta = [(sig, sr, meta_map[id(sig)]) for sig, sr in filtered]
+
+    # Dispatch highest-scoring Tier 1 candidates, respecting book quotas
+    dispatched_naked = 0
+    dispatched_hedged = 0
+
+    for sig, score_result, md in filtered_with_meta:
+        tier = score_result["tier"]
+        if tier == 0:
+            continue  # dropped
+        if tier == 2 and not sig.vol_provisional:
+            continue  # watchlist only — dispatch tier 2 only for provisional cold-start
+
+        score_int = score_result["score"]
+        sym = sig.symbol
+        analysis = md["analysis"]
+        lot = md["lot"]
+        step = md["step"]
+        spot = analysis["spot"]
+        pcr = analysis["pcr_oi"]
+        max_pain = analysis["max_pain"]
+        call_wall = analysis["call_wall"]
+        put_wall = analysis["put_wall"]
+        oc = analysis["raw_oc"]
+        expiry = analysis["expiry"]
+        atm = int(round(spot / step) * step)
+        reg_line = f"Regime: {sig.direction} / {sig.vol_regime} / {sig.playbook_id}"
+        conf_block = format_confluence_breakdown(sig, score_result)
+
+        # ── Naked directional (PB1) ──
+        if sig.playbook_id == "PB1" and len(naked_trades) + dispatched_naked < 3:
+            strike = sig.atm_strike or float(atm)
+            opt_type = "CE" if sig.direction in ("BULL", "STRONG_BULL") else "PE"
+            opt_price = get_strike_ltp(oc, strike, opt_type)
+            if opt_price is None:
+                logger.error("DATA_FAULT PB1 sym=%s %s ltp=None aborting", sym, opt_type)
+                print(f"   🚫 {sym} PB1 {opt_type}: DATA_FAULT ltp unavailable — trade aborted.")
+                continue
+
+            sl = round(opt_price * 0.80, 2)
+            t1 = round(opt_price * 1.25, 2)
+            t2 = round(opt_price * 1.50, 2)
+            trade_id = f"{today_tag}-NAKED-{len(naked_trades)+dispatched_naked+1:02d}"
+            contract = f"{sym} {strike:.0f} {opt_type}"
+            strategy = (
+                "Bullish Call Momentum (Upside Breakout)"
+                if opt_type == "CE"
+                else "Bearish Put Momentum (Downside Expansion)"
+            )
             new_trade = {
-                "trade_id": trade_id, "book": "HEDGED", "symbol": sym,
-                "contract": contract, "action": "SELL",
-                "strategy": "0DTE Delta-Neutral Iron Condor",
-                "qty": lot, "entry_time": now_str, "entry_price": net_credit,
-                "stop_loss": round(net_credit * 2.0, 2),
-                "target_1": round(net_credit * 0.20, 2),
+                "trade_id": trade_id, "book": "NAKED", "symbol": sym,
+                "contract": contract, "action": "BUY", "strategy": strategy,
+                "qty": lot, "entry_time": now_str, "entry_price": opt_price,
+                "stop_loss": sl, "target_1": t1, "target_2": t2,
                 "status": "ACTIVE", "exit_time": None, "exit_price": None,
-                "exit_reason": None, "margin_deployed": 42000.0
+                "exit_reason": None,
+                "margin_deployed": round(opt_price * lot, 2),
+                "confluence_score": score_int,
+                "playbook": sig.playbook_id,
             }
             trades.append(new_trade)
             _write_ledger(trades, LEDGER_FILE)
             cooldowns[sym] = time.time()
             save_cooldown_state(cooldowns)
+            dispatched_naked += 1
+
+            if opt_type == "CE":
+                chain_thesis = (
+                    f"• *Put-Call Ratio (PCR):* {pcr:.2f} (Strong Put Writing Support)\n"
+                    f"• *Max Pain Strike:* {max_pain:.0f} (Spot is {spot - max_pain:.1f} pts above)\n"
+                    f"• *Call Wall Breakout:* {call_wall:.0f} (Short Covering Acceleration)"
+                )
+            else:
+                chain_thesis = (
+                    f"• *Put-Call Ratio (PCR):* {pcr:.2f} (Bearish Call Heavy Pressure)\n"
+                    f"• *Max Pain Strike:* {max_pain:.0f} (Spot is {max_pain - spot:.1f} pts below)\n"
+                    f"• *Call Resistance Wall:* {call_wall:.0f} (Overhead Supply)\n"
+                    f"• *Downside Target Wall:* {put_wall:.0f} (Next Major Support)"
+                )
+
+            msg = f"""🚨 *STOCKERA QUANT: NAKED DIRECTIONAL BUY ALERT* 🚨
+━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
+📅 *Expiry:* `{expiry}` | *Book:* 🔴 NAKED DIRECTIONAL
+📌 *Strategy:* {strategy}
+━━━━━━━━━━━━━━━━━━━━━━━━━
+🧠 *OPTION CHAIN MICROSTRUCTURE THESIS:*
+{chain_thesis}
+━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 *EXACT ORDER TO EXECUTE:*
+• 🟢 `BUY  {contract} @ Limit ₹{opt_price:.2f} ({lot} Qty / 1 Lot)`
+
+💰 *RISK & REWARD BLUEPRINT:*
+• *Capital Deployed:* ₹{opt_price * lot:,.2f}
+• *Hard Stop-Loss:* ₹{sl:.2f} (-20% / Risk -₹{(opt_price - sl) * lot:,.2f})
+• *Target 1 (Book 50%):* ₹{t1:.2f} (+25% / +₹{(t1 - opt_price) * lot:,.2f}) 🎯
+• *Target 2 (Trail SL):* ₹{t2:.2f} (+50% / +₹{(t2 - opt_price) * lot:,.2f}) 🚀
+• *Realized R:R Ratio:* 1 : 2.50 ✅
+━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 *{reg_line}*
+{conf_block}
+⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
+            print(f"\n🚀 DISPATCHING NAKED ALERT (score={score_int}/100):\n{msg}\n")
+            send_telegram_alert(msg)
+
+        # ── Hedged spread / condor (PB2, PB6) ──
+        elif sig.playbook_id in ("PB2", "PB6") and len(hedged_trades) + dispatched_hedged < 3:
+            s_ce = sig.short_strike_ce or float(atm + 2 * step)
+            b_ce = sig.long_strike_ce or float(atm + 4 * step)
+            s_pe = sig.short_strike_pe or float(atm - 2 * step)
+            b_pe = sig.long_strike_pe or float(atm - 4 * step)
+
+            p_sce = get_strike_ltp(oc, s_ce, "CE")
+            p_bce = get_strike_ltp(oc, b_ce, "CE")
+            p_spe = get_strike_ltp(oc, s_pe, "PE")
+            p_bpe = get_strike_ltp(oc, b_pe, "PE")
+
+            # P0.5: All 4 legs must have live prices.
+            if any(p is None for p in [p_sce, p_bce, p_spe, p_bpe]):
+                missing = [n for n, p in [("s_ce", p_sce), ("b_ce", p_bce), ("s_pe", p_spe), ("b_pe", p_bpe)] if p is None]
+                logger.error("DATA_FAULT hunt_market_once sym=%s condor legs=%s ltp=None aborting", sym, missing)
+                print(f"   🚫 {sym} HEDGED CONDOR: DATA_FAULT legs {missing} ltp unavailable — trade aborted.")
+                continue
+
+            net_credit = round((p_sce - p_bce) + (p_spe - p_bpe), 2)
+            max_profit = round(net_credit * lot, 2)
+            lower_be = s_pe - net_credit
+            upper_be = s_ce + net_credit
+
+            strategy_name = "Iron Butterfly (Max Pain Pin)" if sig.playbook_id == "PB2" else "0DTE Delta-Neutral Iron Condor"
+            trade_id = f"{today_tag}-HEDGE-{len(hedged_trades)+dispatched_hedged+1:02d}"
+            contract = f"{sym} {s_pe:.0f} PE / {s_ce:.0f} CE Condor"
+
+            new_trade = {
+                "trade_id": trade_id, "book": "HEDGED", "symbol": sym,
+                "contract": contract, "action": "SELL",
+                "strategy": strategy_name,
+                "qty": lot, "entry_time": now_str, "entry_price": net_credit,
+                "stop_loss": round(net_credit * 2.0, 2),
+                "target_1": round(net_credit * 0.20, 2),
+                "status": "ACTIVE", "exit_time": None, "exit_price": None,
+                "exit_reason": None, "margin_deployed": 42000.0,
+                "confluence_score": score_int,
+                "playbook": sig.playbook_id,
+            }
+            trades.append(new_trade)
+            _write_ledger(trades, LEDGER_FILE)
+            cooldowns[sym] = time.time()
+            save_cooldown_state(cooldowns)
+            dispatched_hedged += 1
 
             msg = f"""🚨 *STOCKERA QUANT: HEDGED BASKET ALERT* 🚨
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
 📅 *Expiry:* `{expiry}` | *Book:* 🟢 HEDGED INCOME
-📌 *Strategy:* 0DTE Range-Bound Iron Condor (PoP: 78.4%)
+📌 *Strategy:* {strategy_name}
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 🧠 *OPTION CHAIN MICROSTRUCTURE THESIS:*
 • *Max Pain Strike:* {max_pain:.0f} | *Put-Call Ratio (PCR):* {pcr:.2f}
@@ -435,14 +414,15 @@ def hunt_market_once():
 📋 *EXACT ORDER EXECUTION SEQUENCE:*
 
 🔹 *Step 1: BUY Hedges FIRST (Unlocks Margin Discount)*
-   1. 🟢 `BUY  {sym} {b_ce} CE @ ₹{p_bce:.2f} (Call Hedge Wing)`
-   2. 🟢 `BUY  {sym} {b_pe} PE @ ₹{p_bpe:.2f} (Put Hedge Wing)`
+   1. 🟢 `BUY  {sym} {b_ce:.0f} CE @ ₹{p_bce:.2f} (Call Hedge Wing)`
+   2. 🟢 `BUY  {sym} {b_pe:.0f} PE @ ₹{p_bpe:.2f} (Put Hedge Wing)`
 
 🔹 *Step 2: SELL Short Strikes*
-   3. 🔴 `SELL {sym} {s_ce} CE @ ₹{p_sce:.2f} (Short Call)`
-   4. 🔴 `SELL {sym} {s_pe} PE @ ₹{p_spe:.2f} (Short Put)`
+   3. 🔴 `SELL {sym} {s_ce:.0f} CE @ ₹{p_sce:.2f} (Short Call)`
+   4. 🔴 `SELL {sym} {s_pe:.0f} PE @ ₹{p_spe:.2f} (Short Put)`
 ━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 *{regime_line_h}*
+📊 *{reg_line}*
+{conf_block}
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 💰 *RISK & REWARD BLUEPRINT ({lot} Qty / 1 Lot):*
 • *Net Credit Collected:* +₹{net_credit:.2f} / lot
@@ -452,7 +432,7 @@ def hunt_market_once():
 • *Exit Directive:* Exit basket if combined premium reaches ₹{net_credit * 2:.2f}
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 ⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
-            print(f"\n🚀 DISPATCHING HEDGED BASKET ALERT:\n{msg}\n")
+            print(f"\n🚀 DISPATCHING HEDGED BASKET ALERT (score={score_int}/100):\n{msg}\n")
             send_telegram_alert(msg)
 
 

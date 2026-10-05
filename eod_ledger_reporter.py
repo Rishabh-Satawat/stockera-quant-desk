@@ -1,9 +1,12 @@
 import os
 import sys
 import json
+import logging
 from datetime import datetime
 import requests
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # 1. Load Secrets
 load_dotenv(r"C:\kite-agent\secrets\telegram.env")
@@ -160,6 +163,40 @@ def send_telegram_card(text):
     except Exception as e:
         return False, str(e)
 
+def _record_eod_ivs_all_indices(db_path: str = None) -> None:
+    """Call volatility_engine.record_eod_iv for all 4 indices at 15:30 IST close.
+
+    Requires active chain snapshot data for today; logs a warning and continues
+    for any symbol where data is unavailable.  Never raises — EOD reporting
+    must complete even if IV recording partially fails.
+    """
+    try:
+        from volatility_engine import record_eod_iv
+        from expiry_calendar import get_near_expiry
+        from db_init import DEFAULT_DB_PATH
+    except ImportError as exc:
+        logger.warning("_record_eod_ivs: import failed — %s", exc)
+        return
+
+    if db_path is None:
+        db_path = DEFAULT_DB_PATH
+
+    for sym in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"):
+        try:
+            expiry = get_near_expiry(sym).isoformat()
+        except Exception as exc:
+            logger.warning("_record_eod_ivs: cannot get expiry for %s — %s", sym, exc)
+            continue
+        try:
+            written = record_eod_iv(sym, expiry, db_path)
+            if written:
+                logger.info("EOD IV recorded: %s", sym)
+            else:
+                logger.warning("EOD IV: no valid data to record for %s", sym)
+        except Exception as exc:
+            logger.warning("_record_eod_ivs: record_eod_iv failed for %s — %s", sym, exc)
+
+
 def main():
     if not os.path.exists(LEDGER_PATH):
         print(f"Error: {LEDGER_PATH} not found.")
@@ -171,6 +208,10 @@ def main():
     # Optional flag to square off all active trades
     if "--squareoff" in sys.argv:
         trades = square_off_active_trades(trades)
+
+    # At 15:30 IST: persist today's ATM IV for all 4 indices into iv_history.
+    # This is what makes IVR/IVP functional after the first 20 trading sessions.
+    _record_eod_ivs_all_indices()
 
     metrics = calculate_eod_metrics(trades)
 

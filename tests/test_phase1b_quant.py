@@ -822,7 +822,8 @@ class TestComputeRegime:
         db_path = _make_db(tmp_path)
         result = compute_regime("NIFTY", "2026-10-27", 22000.0, db_path)
         assert set(result.keys()) == {
-            "direction_score", "direction_label", "vol_regime", "playbook", "component_scores"
+            "direction_score", "direction_label", "vol_regime", "vol_provisional",
+            "playbook", "component_scores"
         }
 
     def test_component_scores_has_7_keys(self, tmp_path):

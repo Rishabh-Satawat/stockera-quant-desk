@@ -386,11 +386,26 @@ def compute_regime(
 
     Returns dict with keys:
         direction_score, direction_label, vol_regime, playbook,
+        vol_provisional (True when iv_history < MIN_LOOKBACK_SESSIONS),
         component_scores (dict of 7 named scores)
     """
     # Compute vol metrics for regime
     vol_metrics = compute_vol_metrics(symbol, expiry, db_path)
     vol_regime = vol_metrics.get("vol_regime", "UNKNOWN")
+
+    # Cold-start graceful degradation: treat UNKNOWN as NORMAL_VOL with a
+    # provisional flag so the system keeps trading while iv_history accumulates.
+    # Scoring engine will apply a 10% composite score reduction when this is set.
+    vol_provisional = False
+    if vol_regime is None or vol_regime == "UNKNOWN":
+        vol_regime = "NORMAL_VOL"
+        vol_provisional = True
+        logger.info(
+            "regime_engine: vol_regime UNKNOWN for %s — using NORMAL_VOL (provisional). "
+            "Accumulate >= %d iv_history sessions to resolve.",
+            symbol,
+            20,
+        )
 
     # Compute each of the 7 direction components
     c1_vwap = _score_vwap(symbol, spot, db_path)
@@ -419,6 +434,7 @@ def compute_regime(
         "direction_score": direction_score,
         "direction_label": direction_label,
         "vol_regime": vol_regime,
+        "vol_provisional": vol_provisional,
         "playbook": playbook,
         "component_scores": component_scores,
     }
