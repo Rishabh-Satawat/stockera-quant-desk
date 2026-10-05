@@ -8,3 +8,8 @@ __pycache__/
 access_token.txt
 hunter_state.json
 trades_ledger.json
+# Windows absolute paths that git may surface as untracked on Linux clones
+C:\\*
+# Runtime DB and cached scrip master
+data/*.db
+data/scrip_master_cache.csv
