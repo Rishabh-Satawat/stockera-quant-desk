@@ -3,9 +3,13 @@ import re
 import sys
 import time
 import json
+import logging
 from datetime import datetime
 import requests
 from dotenv import load_dotenv
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 # 1. Load Secrets
 load_dotenv(r"C:\kite-agent\secrets\telegram.env")
@@ -24,6 +28,7 @@ SCRIP_MAP = {
     "SENSEX": 51
 }
 
+
 def parse_contract(contract_str, default_symbol="NIFTY"):
     symbol = default_symbol.upper()
     for s in ["SENSEX", "BANKNIFTY", "NIFTY"]:
@@ -34,6 +39,7 @@ def parse_contract(contract_str, default_symbol="NIFTY"):
     if match:
         return symbol, float(match.group(1)), match.group(2).lower()
     return symbol, None, None
+
 
 def fetch_dhan_chain_price(symbol, strike, opt_type):
     """Fetches real-time option LTP from Dhan HQ v2 Option Chain API."""
@@ -53,16 +59,16 @@ def fetch_dhan_chain_price(symbol, strike, opt_type):
         if resp.status_code == 200:
             data = resp.json().get("data", {})
             oc = data.get("oc", {})
-            # Look up formatted strike (e.g. 23200.000000)
             strike_key = f"{strike:.6f}"
             if strike_key in oc:
                 leg_info = oc[strike_key].get(opt_type, {})
                 ltp = float(leg_info.get("last_price", 0.0))
                 if ltp > 0:
                     return ltp
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error("DATA_FAULT fetch_dhan_chain_price sym=%s strike=%s err=%s", symbol, strike, exc)
     return None
+
 
 def send_telegram_alert(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -71,8 +77,9 @@ def send_telegram_alert(text):
         resp = requests.post(url, json=payload, timeout=8)
         return resp.status_code == 200
     except Exception as e:
-        print(f"Error sending Telegram alert: {e}")
+        logger.warning("Error sending Telegram alert: %s", e)
         return False
+
 
 def run_sentinel(simulation=False):
     print("=" * 60)
@@ -81,9 +88,7 @@ def run_sentinel(simulation=False):
     print(f"Polling Interval: 3 seconds | Broadcast Target: {TELEGRAM_CHAT_ID}")
     print("=" * 60)
 
-    tick = 0
     while True:
-        tick += 1
         if not os.path.exists(LEDGER_PATH):
             time.sleep(4)
             continue
@@ -110,15 +115,21 @@ def run_sentinel(simulation=False):
             sl = float(t.get("stop_loss", entry * 0.8))
             t1 = float(t.get("target_1", entry * 1.25))
 
-            # Fetch price from Dhan live feed or fallback simulation
+            # P0.6: Fetch live price only — never fabricate a synthetic walk.
             ltp = None
-            if not simulation and strike and opt_type:
+            if strike and opt_type:
                 ltp = fetch_dhan_chain_price(symbol, strike, opt_type)
 
             if ltp is None:
-                # Simulation / off-market fallback
-                delta = (t1 - entry) * (tick * 0.35)
-                ltp = round(entry + delta, 2)
+                # P0.6: Live feed lost → mark UNRESOLVED, never simulate a win.
+                logger.error(
+                    "DATA_FAULT run_sentinel trade_id=%s live_feed_lost setting UNRESOLVED", trade_id
+                )
+                print(f"  ⚠️ {trade_id} ({contract}): DATA_FAULT live feed lost → UNRESOLVED")
+                t["status"] = "UNRESOLVED"
+                t["exit_reason"] = "DATA_FAULT_LIVE_FEED_LOST"
+                updated = True
+                continue
 
             pnl_pts = round(ltp - entry if action == "BUY" else entry - ltp, 2)
             print(f"  • {trade_id} ({contract}): Entry: ₹{entry} | LTP: ₹{ltp} | Target: ₹{t1} | SL: ₹{sl}")
@@ -175,6 +186,7 @@ def run_sentinel(simulation=False):
                 json.dump(trades, f, indent=2)
 
         time.sleep(3)
+
 
 if __name__ == "__main__":
     is_sim = "--simulate" in sys.argv or "--test" in sys.argv

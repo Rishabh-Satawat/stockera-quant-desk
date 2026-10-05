@@ -86,18 +86,21 @@ def analyze_order_flow(symbol):
                 pass
 
     # 3. Dynamic Institutional Calibration (Zero-Depth Immunity)
+    # P0.8: Rename static volume difference to vol_diff; flag is_cvd=False so no
+    # consumer mistakenly treats this as aggressor tick CVD (which requires L1
+    # tick data that Dhan chain API does not provide).
     if tot_bid_qty == 0 or tot_ask_qty == 0:
         base_vol = 350000 if sym == "NIFTY" else (180000 if sym == "SENSEX" else 220000)
         imbalance = round(pcr if pcr > 0 else 0.86, 2)
         tot_ask_qty = int(base_vol)
         tot_bid_qty = int(base_vol * imbalance)
-        cvd_val = round(-1 * base_vol * (1.0 - imbalance) * 0.35, 0)
+        vol_diff = round(-1 * base_vol * (1.0 - imbalance) * 0.35, 0)
     else:
         imbalance = round(tot_bid_qty / tot_ask_qty, 2)
-        cvd_val = round((call_vol - put_vol) * 0.25, 0)
+        vol_diff = round((call_vol - put_vol) * 0.25, 0)
 
     if sym in CVD_MEMORY:
-        CVD_MEMORY[sym]["cvd"] = cvd_val
+        CVD_MEMORY[sym]["cvd"] = vol_diff
 
     # 4. Institutional Absorption & Tape Reading Diagnostics
     if imbalance > 1.25:
@@ -118,7 +121,10 @@ def analyze_order_flow(symbol):
         "bid_qty": tot_bid_qty,
         "ask_qty": tot_ask_qty,
         "imbalance_ratio": imbalance,
-        "cvd": cvd_val,
+        # P0.8: vol_diff = call_vol - put_vol (static chain snapshot, NOT aggressor CVD).
+        # is_cvd=False: consumers must NOT treat this as tick-level Cumulative Volume Delta.
+        "vol_diff": vol_diff,
+        "is_cvd": False,
         "delta_pressure": delta_pressure,
         "absorption_status": absorption,
         "tape_reading": tape_reading,
@@ -132,6 +138,6 @@ if __name__ == "__main__":
     for s in ["NIFTY", "SENSEX", "BANKNIFTY"]:
         r = analyze_order_flow(s)
         print(f"\n[{s}] Imbalance: {r['imbalance_ratio']} | Bids: {r['bid_qty']:,} | Asks: {r['ask_qty']:,}")
-        print(f"  • CVD: {r['cvd']:+,.0f} ({r['delta_pressure']})")
+        print(f"  • vol_diff (is_cvd={r['is_cvd']}): {r['vol_diff']:+,.0f} ({r['delta_pressure']})")
         print(f"  • Verdict: {r['absorption_status']}")
         print(f"  • Tape: {r['tape_reading']}")
