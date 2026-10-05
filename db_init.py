@@ -69,6 +69,21 @@ CREATE TABLE IF NOT EXISTS option_bars (
 
 CREATE INDEX IF NOT EXISTS idx_obars_lookup
     ON option_bars (symbol, expiry, option_type, bar_tf, bar_open_ts);
+
+CREATE TABLE IF NOT EXISTS iv_history (
+    symbol       TEXT NOT NULL,
+    trade_date   TEXT NOT NULL,   -- ISO date YYYY-MM-DD IST
+    expiry       TEXT NOT NULL,
+    atm_iv       REAL,
+    iv_25d_put   REAL,
+    iv_25d_call  REAL,
+    spot         REAL,
+    source       TEXT DEFAULT 'EOD_SNAPSHOT',
+    PRIMARY KEY (symbol, trade_date)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_iv_history_lookup
+    ON iv_history (symbol, trade_date);
 """
 
 

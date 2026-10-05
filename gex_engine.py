@@ -214,4 +214,10 @@ def compute_gex(
         "max_pain": max_pain_val,
         "pin_score": pin_score,
         "per_strike_gex": per_strike,
+        # Provisional assumption: dealers are long calls / short puts (standard
+        # market-maker hedging convention for equity index options).  This is the
+        # industry-standard sign convention but has NOT been empirically validated
+        # against observed pinning behaviour for Indian index options.  Treat
+        # gamma flip and total_net_gex as indicative until validated.
+        "gex_dealer_assumption": "long_call_short_put",
     }
