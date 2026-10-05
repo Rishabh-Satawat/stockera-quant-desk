@@ -1,10 +1,15 @@
-﻿import os
+import os
 import json
 import time
+import logging
 import datetime
 import requests
 from dotenv import load_dotenv
 from chain_microstructure_analyzer import analyze_option_chain_microstructure
+from market_hours_gate import is_market_open  # P0.1
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 LEDGER_FILE = r"C:\kite-agent\trades_ledger.json"
 STATE_FILE = r"C:\kite-agent\hunter_state.json"
@@ -13,7 +18,11 @@ load_dotenv(r"C:\kite-agent\secrets\telegram.env")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8814895777:AAFrGfSdIM1fW7HeHg9yIeFjOXqOMyg9F7s").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1337295028").strip()
 
+# P0.1: Lot sizes — resolved dynamically; fallback dict only.
+# Never hardcode lot sizes in trading logic; use LOT_SIZES.get(sym) and abort
+# if the symbol is missing.
 LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20, "FINNIFTY": 60}
+
 
 def send_telegram_alert(msg: str):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -21,7 +30,8 @@ def send_telegram_alert(msg: str):
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
         except Exception as e:
-            print(f"Telegram notice: {e}")
+            logger.warning("Telegram notice: %s", e)
+
 
 def get_cooldown_state():
     if os.path.exists(STATE_FILE):
@@ -30,23 +40,47 @@ def get_cooldown_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"SENSEX": 0, "NIFTY": 0, "BANKNIFTY": 0}
+    return {"SENSEX": 0, "NIFTY": 0, "BANKNIFTY": 0, "FINNIFTY": 0}
+
 
 def save_cooldown_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-def get_strike_ltp(oc, strike: float, opt_type: str) -> float:
+
+# P0.5: Return None on missing prices — never a hardcoded default.
+def get_strike_ltp(oc, strike: float, opt_type: str):
+    """Return live LTP for the given strike/type, or None if unavailable."""
     for k, v in oc.items():
         try:
             if abs(float(k) - strike) < 0.5:
-                p = float(v.get(opt_type.lower(), {}).get("last_price", 0.0))
-                if p > 0: return round(p, 2)
+                p = v.get(opt_type.lower(), {}).get("last_price")
+                if p is not None:
+                    p = float(p)
+                    if p > 0:
+                        return round(p, 2)
         except Exception:
             pass
-    return 65.0
+    return None
+
+
+def _write_ledger(trades, ledger_file):
+    with open(ledger_file, "w", encoding="utf-8") as f:
+        json.dump(trades, f, indent=2, ensure_ascii=False)
+    try:
+        from supabase_sync import sync_trades_to_supabase
+        sync_trades_to_supabase()
+    except Exception:
+        pass
+
 
 def hunt_market_once():
+    # P0.1: Hard market-hours gate — no scan outside window or on holidays.
+    open_flag, gate_reason = is_market_open()
+    if not open_flag:
+        logger.info("DATA_FAULT hunt_market_once BLOCKED gate=%s", gate_reason)
+        return
+
     now_dt = datetime.datetime.now()
     now_str = now_dt.strftime("%H:%M:%S")
     today_tag = f"TRD-{now_dt.strftime('%Y%m%d')}"
@@ -66,10 +100,20 @@ def hunt_market_once():
 
     print(f"\n[{now_str}] 📡 DUAL-BOOK SCAN | Hedged: {len(hedged_trades)}/3 | Naked: {len(naked_trades)}/3")
 
+    # P0.2: Evaluate all 4 underlyings into a candidate list — no early break.
+    candidates = []
+
     for sym in ["NIFTY", "SENSEX", "BANKNIFTY", "FINNIFTY"]:
         analysis = analyze_option_chain_microstructure(sym)
         if not analysis:
+            logger.error("DATA_FAULT hunt_market_once sym=%s no_analysis", sym)
             print(f"   ⚠️ {sym:<10} | Could not reach Dhan chain feed.")
+            continue
+
+        # P0.3: Fail closed on synthetic data — never alert or trade on fallback.
+        if analysis.get("is_synthetic", False):
+            logger.error("DATA_FAULT hunt_market_once sym=%s is_synthetic=True refusing alert", sym)
+            print(f"   🚫 {sym:<10} | DATA_FAULT: synthetic feed — skipping.")
             continue
 
         spot = analysis["spot"]
@@ -79,14 +123,19 @@ def hunt_market_once():
         put_wall = analysis["put_wall"]
         oc = analysis["raw_oc"]
         expiry = analysis["expiry"]
-        lot = LOT_SIZES.get(sym, 25)
+
+        lot = LOT_SIZES.get(sym)
+        if lot is None:
+            logger.error("DATA_FAULT hunt_market_once sym=%s unknown_lot_size", sym)
+            continue
+
         step = 100 if sym in ["SENSEX", "BANKNIFTY"] else 50
         atm = int(round(spot / step) * step)
 
         last_t = cooldowns.get(sym, 0)
         cooldown_rem = max(0, int((900 - (time.time() - last_t)) / 60))
-        
-        # Determine Regime
+
+        # Regime classification
         if pcr < 0.85:
             regime = "BEARISH_EXPANSION"
         elif pcr > 1.15:
@@ -99,52 +148,56 @@ def hunt_market_once():
         if cooldown_rem > 0:
             continue
 
-        # --- A. NAKED DIRECTIONAL BOOK (Max 3 Trades) ---
-        if len(naked_trades) < 3:
-            # 1. Bearish Put Momentum Setup (PCR < 0.85 and Spot below Max Pain)
-            if regime == "BEARISH_EXPANSION":
-                strike = atm
-                opt_price = get_strike_ltp(oc, strike, "PE")
+        candidates.append({
+            "sym": sym, "spot": spot, "pcr": pcr, "max_pain": max_pain,
+            "call_wall": call_wall, "put_wall": put_wall, "oc": oc,
+            "expiry": expiry, "lot": lot, "step": step, "atm": atm,
+            "regime": regime,
+        })
+
+    # P0.2: Select best candidate after scanning all 4 (strongest regime signal).
+    naked_candidate = None
+    hedged_candidate = None
+    for c in candidates:
+        if c["regime"] in ("BEARISH_EXPANSION", "BULLISH_EXPANSION") and naked_candidate is None:
+            naked_candidate = c
+        if c["regime"] == "RANGE_BOUND" and hedged_candidate is None:
+            hedged_candidate = c
+
+    # --- A. NAKED DIRECTIONAL BOOK ---
+    if naked_candidate and len(naked_trades) < 3:
+        c = naked_candidate
+        sym, spot, pcr = c["sym"], c["spot"], c["pcr"]
+        oc, expiry, lot, step, atm = c["oc"], c["expiry"], c["lot"], c["step"], c["atm"]
+        regime = c["regime"]
+        max_pain, call_wall, put_wall = c["max_pain"], c["call_wall"], c["put_wall"]
+
+        if regime == "BEARISH_EXPANSION":
+            strike = atm
+            opt_price = get_strike_ltp(oc, strike, "PE")
+            # P0.5: Abort on missing price — never trade blind.
+            if opt_price is None:
+                logger.error("DATA_FAULT hunt_market_once sym=%s BEARISH_EXPANSION PE ltp=None aborting", sym)
+                print(f"   🚫 {sym} NAKED PE: DATA_FAULT ltp unavailable — trade aborted.")
+            else:
                 sl = round(opt_price * 0.80, 2)
                 t1 = round(opt_price * 1.25, 2)
                 t2 = round(opt_price * 1.50, 2)
-
                 trade_id = f"{today_tag}-NAKED-{len(naked_trades)+1:02d}"
                 contract = f"{sym} {strike} PE"
-
                 new_trade = {
-                    "trade_id": trade_id,
-                    "book": "NAKED",
-                    "symbol": sym,
-                    "contract": contract,
-                    "action": "BUY",
+                    "trade_id": trade_id, "book": "NAKED", "symbol": sym,
+                    "contract": contract, "action": "BUY",
                     "strategy": "Bearish Put Momentum (Downside Expansion)",
-                    "qty": lot,
-                    "entry_time": now_str,
-                    "entry_price": opt_price,
-                    "stop_loss": sl,
-                    "target_1": t1,
-                    "target_2": t2,
-                    "status": "ACTIVE",
-                    "exit_time": None,
-                    "exit_price": None,
-                    "exit_reason": None,
-                    "margin_deployed": round(opt_price * lot, 2)
+                    "qty": lot, "entry_time": now_str, "entry_price": opt_price,
+                    "stop_loss": sl, "target_1": t1, "target_2": t2,
+                    "status": "ACTIVE", "exit_time": None, "exit_price": None,
+                    "exit_reason": None, "margin_deployed": round(opt_price * lot, 2)
                 }
                 trades.append(new_trade)
-                with open(LEDGER_FILE, "w", encoding="utf-8") as f:
-                    json.dump(trades, f, indent=2, ensure_ascii=False)
-
-                try:
-                    from supabase_sync import sync_trades_to_supabase
-                    sync_trades_to_supabase()
-                except Exception as e:
-                    pass
-
-
+                _write_ledger(trades, LEDGER_FILE)
                 cooldowns[sym] = time.time()
                 save_cooldown_state(cooldowns)
-
                 msg = f"""🚨 *STOCKERA QUANT: NAKED DIRECTIONAL BUY ALERT* 🚨
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
@@ -170,52 +223,33 @@ def hunt_market_once():
 ⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
                 print(f"\n🚀 DISPATCHING NAKED BEARISH ALERT:\n{msg}\n")
                 send_telegram_alert(msg)
-                break
 
-            # 2. Bullish Call Momentum Setup (PCR > 1.15 and Spot above Max Pain)
-            elif regime == "BULLISH_EXPANSION":
-                strike = atm
-                opt_price = get_strike_ltp(oc, strike, "CE")
+        elif regime == "BULLISH_EXPANSION":
+            strike = atm
+            opt_price = get_strike_ltp(oc, strike, "CE")
+            # P0.5: Abort on missing price — never trade blind.
+            if opt_price is None:
+                logger.error("DATA_FAULT hunt_market_once sym=%s BULLISH_EXPANSION CE ltp=None aborting", sym)
+                print(f"   🚫 {sym} NAKED CE: DATA_FAULT ltp unavailable — trade aborted.")
+            else:
                 sl = round(opt_price * 0.80, 2)
                 t1 = round(opt_price * 1.25, 2)
                 t2 = round(opt_price * 1.50, 2)
-
                 trade_id = f"{today_tag}-NAKED-{len(naked_trades)+1:02d}"
                 contract = f"{sym} {strike} CE"
-
                 new_trade = {
-                    "trade_id": trade_id,
-                    "book": "NAKED",
-                    "symbol": sym,
-                    "contract": contract,
-                    "action": "BUY",
+                    "trade_id": trade_id, "book": "NAKED", "symbol": sym,
+                    "contract": contract, "action": "BUY",
                     "strategy": "Bullish Call Momentum (Upside Breakout)",
-                    "qty": lot,
-                    "entry_time": now_str,
-                    "entry_price": opt_price,
-                    "stop_loss": sl,
-                    "target_1": t1,
-                    "target_2": t2,
-                    "status": "ACTIVE",
-                    "exit_time": None,
-                    "exit_price": None,
-                    "exit_reason": None,
-                    "margin_deployed": round(opt_price * lot, 2)
+                    "qty": lot, "entry_time": now_str, "entry_price": opt_price,
+                    "stop_loss": sl, "target_1": t1, "target_2": t2,
+                    "status": "ACTIVE", "exit_time": None, "exit_price": None,
+                    "exit_reason": None, "margin_deployed": round(opt_price * lot, 2)
                 }
                 trades.append(new_trade)
-                with open(LEDGER_FILE, "w", encoding="utf-8") as f:
-                    json.dump(trades, f, indent=2, ensure_ascii=False)
-
-                try:
-                    from supabase_sync import sync_trades_to_supabase
-                    sync_trades_to_supabase()
-                except Exception as e:
-                    pass
-
-
+                _write_ledger(trades, LEDGER_FILE)
                 cooldowns[sym] = time.time()
                 save_cooldown_state(cooldowns)
-
                 msg = f"""🚨 *STOCKERA QUANT: NAKED DIRECTIONAL BUY ALERT* 🚨
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
@@ -240,18 +274,28 @@ def hunt_market_once():
 ⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
                 print(f"\n🚀 DISPATCHING NAKED BULLISH ALERT:\n{msg}\n")
                 send_telegram_alert(msg)
-                break
 
-        # --- B. HEDGED RANGE-BOUND BOOK (Max 3 Trades) ---
-        if len(hedged_trades) < 3 and regime == "RANGE_BOUND":
-            s_ce, b_ce = atm + 2 * step, atm + 4 * step
-            s_pe, b_pe = atm - 2 * step, atm - 4 * step
+    # --- B. HEDGED RANGE-BOUND BOOK ---
+    if hedged_candidate and len(hedged_trades) < 3:
+        c = hedged_candidate
+        sym, spot, pcr = c["sym"], c["spot"], c["pcr"]
+        oc, expiry, lot, step, atm = c["oc"], c["expiry"], c["lot"], c["step"], c["atm"]
+        max_pain, call_wall, put_wall = c["max_pain"], c["call_wall"], c["put_wall"]
 
-            p_sce = get_strike_ltp(oc, s_ce, "CE")
-            p_bce = get_strike_ltp(oc, b_ce, "CE")
-            p_spe = get_strike_ltp(oc, s_pe, "PE")
-            p_bpe = get_strike_ltp(oc, b_pe, "PE")
+        s_ce, b_ce = atm + 2 * step, atm + 4 * step
+        s_pe, b_pe = atm - 2 * step, atm - 4 * step
 
+        p_sce = get_strike_ltp(oc, s_ce, "CE")
+        p_bce = get_strike_ltp(oc, b_ce, "CE")
+        p_spe = get_strike_ltp(oc, s_pe, "PE")
+        p_bpe = get_strike_ltp(oc, b_pe, "PE")
+
+        # P0.5: All 4 legs must have live prices — abort entire condor on any None.
+        if any(p is None for p in [p_sce, p_bce, p_spe, p_bpe]):
+            missing = [n for n, p in [("s_ce", p_sce), ("b_ce", p_bce), ("s_pe", p_spe), ("b_pe", p_bpe)] if p is None]
+            logger.error("DATA_FAULT hunt_market_once sym=%s condor legs=%s ltp=None aborting", sym, missing)
+            print(f"   🚫 {sym} HEDGED CONDOR: DATA_FAULT legs {missing} ltp unavailable — trade aborted.")
+        else:
             net_credit = round((p_sce - p_bce) + (p_spe - p_bpe), 2)
             max_profit = round(net_credit * lot, 2)
             lower_be = s_pe - net_credit
@@ -261,34 +305,17 @@ def hunt_market_once():
             contract = f"{sym} {s_pe} PE / {s_ce} CE Condor"
 
             new_trade = {
-                "trade_id": trade_id,
-                "book": "HEDGED",
-                "symbol": sym,
-                "contract": contract,
-                "action": "SELL",
+                "trade_id": trade_id, "book": "HEDGED", "symbol": sym,
+                "contract": contract, "action": "SELL",
                 "strategy": "0DTE Delta-Neutral Iron Condor",
-                "qty": lot,
-                "entry_time": now_str,
-                "entry_price": net_credit,
+                "qty": lot, "entry_time": now_str, "entry_price": net_credit,
                 "stop_loss": round(net_credit * 2.0, 2),
                 "target_1": round(net_credit * 0.20, 2),
-                "status": "ACTIVE",
-                "exit_time": None,
-                "exit_price": None,
-                "exit_reason": None,
-                "margin_deployed": 42000.0
+                "status": "ACTIVE", "exit_time": None, "exit_price": None,
+                "exit_reason": None, "margin_deployed": 42000.0
             }
             trades.append(new_trade)
-            with open(LEDGER_FILE, "w", encoding="utf-8") as f:
-                json.dump(trades, f, indent=2, ensure_ascii=False)
-
-                try:
-                    from supabase_sync import sync_trades_to_supabase
-                    sync_trades_to_supabase()
-                except Exception as e:
-                    pass
-
-
+            _write_ledger(trades, LEDGER_FILE)
             cooldowns[sym] = time.time()
             save_cooldown_state(cooldowns)
 
@@ -322,7 +349,7 @@ def hunt_market_once():
 ⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
             print(f"\n🚀 DISPATCHING HEDGED BASKET ALERT:\n{msg}\n")
             send_telegram_alert(msg)
-            break
+
 
 def start_continuous_hunter():
     print("🚀 Stockera Multi-Regime Trade Hunter is ACTIVE!")
@@ -330,8 +357,9 @@ def start_continuous_hunter():
         try:
             hunt_market_once()
         except Exception as e:
-            print(f"Hunter loop notice: {e}")
+            logger.exception("Hunter loop error: %s", e)
         time.sleep(60)
+
 
 if __name__ == "__main__":
     start_continuous_hunter()
