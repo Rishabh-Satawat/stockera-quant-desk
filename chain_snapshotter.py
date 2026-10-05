@@ -168,19 +168,34 @@ def _fetch_and_persist(symbol: str, db_path: str) -> int:
     return len(rows)
 
 
-def get_latest_chain_snapshot(symbol: str, db_path: str = DEFAULT_DB_PATH) -> dict:
+def get_latest_chain_snapshot(
+    symbol: str,
+    db_path: str = DEFAULT_DB_PATH,
+    max_age_seconds: float = 90,
+) -> dict:
     """Return the most recent chain snapshot for *symbol* from SQLite.
 
     Returns a dict with keys:
-      "oc"      - {strike_str: {"ce": {...}, "pe": {...}}}
-      "expiry"  - expiry date string (YYYY-MM-DD)
-      "symbol"  - the symbol
+      "oc"                  - {strike_str: {"ce": {...}, "pe": {...}}}
+      "expiry"              - expiry date string (YYYY-MM-DD)
+      "symbol"              - the symbol
+      "snapshot_age_seconds"- age of snapshot in seconds (float)
 
-    Returns an empty dict when no snapshot exists for this symbol yet.
+    Returns an empty dict ({}) when:
+      - No snapshot exists yet.
+      - The newest snapshot's date != today's trading date in IST.
+      - The snapshot is older than max_age_seconds (default 90s).
+
+    An empty return triggers is_synthetic=True in chain_microstructure_analyzer
+    which causes the hunter to log DATA_FAULT and abort — fail-closed design.
+
     The returned dict is derived from the chain_snapshots table written by
     the single-writer snapshotter; callers MUST NOT hit Dhan directly.
     """
     try:
+        now_ist = datetime.datetime.now(tz=ZoneInfo("Asia/Kolkata"))
+        today_str = now_ist.strftime("%Y-%m-%d")
+
         conn = get_connection(db_path)
         try:
             # Find the latest timestamp for this symbol
@@ -193,6 +208,38 @@ def get_latest_chain_snapshot(symbol: str, db_path: str = DEFAULT_DB_PATH) -> di
                 return {}
 
             latest_ts = row[0]
+
+            # Parse the ISO timestamp (may have +05:30 offset or be naive IST)
+            try:
+                snap_dt = datetime.datetime.fromisoformat(latest_ts)
+                if snap_dt.tzinfo is None:
+                    snap_dt = snap_dt.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+                else:
+                    snap_dt = snap_dt.astimezone(ZoneInfo("Asia/Kolkata"))
+            except ValueError:
+                logger.error(
+                    "get_latest_chain_snapshot sym=%s invalid ts=%s", symbol, latest_ts
+                )
+                return {}
+
+            # Staleness gate 1: snapshot must be from today (IST date)
+            snap_date_str = snap_dt.strftime("%Y-%m-%d")
+            if snap_date_str != today_str:
+                logger.warning(
+                    "STALENESS_GATE sym=%s snap_date=%s today=%s — rejecting stale snapshot",
+                    symbol, snap_date_str, today_str,
+                )
+                return {}
+
+            # Staleness gate 2: snapshot must be recent enough
+            age_seconds = (now_ist - snap_dt).total_seconds()
+            if age_seconds > max_age_seconds:
+                logger.warning(
+                    "STALENESS_GATE sym=%s age=%.1fs max=%ss — rejecting stale snapshot",
+                    symbol, age_seconds, max_age_seconds,
+                )
+                return {}
+
             cur = conn.execute(
                 """SELECT strike, option_type, expiry, ltp, oi, volume,
                           iv, delta, theta, gamma, vega, security_id
@@ -228,7 +275,12 @@ def get_latest_chain_snapshot(symbol: str, db_path: str = DEFAULT_DB_PATH) -> di
                 },
             }
 
-        return {"symbol": symbol, "expiry": expiry, "oc": oc}
+        return {
+            "symbol": symbol,
+            "expiry": expiry,
+            "oc": oc,
+            "snapshot_age_seconds": round(age_seconds, 1),
+        }
 
     except Exception as exc:
         logger.error("get_latest_chain_snapshot sym=%s err=%s", symbol, exc)

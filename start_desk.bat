@@ -9,8 +9,8 @@ echo.
 
 cd /d C:\kite-agent
 
-echo [*] Step 1: Terminating stale background processes...
-powershell -Command "Get-Process -Name python, streamlit -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -notlike '*Autonomous Orchestrator*' } | Stop-Process -Force" 2>nul
+echo [*] Step 1: Terminating stale C:\kite-agent processes...
+powershell -Command "Get-WmiObject Win32_Process | Where-Object { ($_.Name -eq 'python.exe' -or $_.Name -eq 'streamlit.exe') -and $_.CommandLine -like '*C:\kite-agent*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" 2>nul
 timeout /t 2 /nobreak >nul
 
 echo [*] Step 2: Verifying ledger and secrets...

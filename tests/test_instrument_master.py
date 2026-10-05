@@ -10,6 +10,7 @@ Tests cover:
 """
 
 import datetime
+from datetime import timezone
 import io
 import csv
 import pytest
@@ -73,7 +74,7 @@ def _row(
 def _inject_rows(rows: list[dict], monkeypatch):
     """Bypass HTTP/cache — inject rows directly into the module globals."""
     monkeypatch.setattr(im, "_loaded_rows", rows)
-    monkeypatch.setattr(im, "_loaded_at", datetime.datetime.utcnow())
+    monkeypatch.setattr(im, "_loaded_at", datetime.datetime.now(timezone.utc))
 
 
 # ---------------------------------------------------------------------------

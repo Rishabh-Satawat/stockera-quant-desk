@@ -22,12 +22,20 @@ def analyze_option_chain_microstructure(symbol: str, db_path: str = DEFAULT_DB_P
     When the snapshot is absent, returns is_synthetic=True so callers refuse
     to alert or trade.
     """
+    import datetime
     spots = get_live_spots()
     spot = spots.get(symbol) or 0.0
+    spot_fetched_at = datetime.datetime.now().isoformat(timespec="seconds")
     step = 100 if symbol in ["SENSEX", "BANKNIFTY"] else 50
     atm = int(round(spot / step) * step)
 
     snapshot = get_latest_chain_snapshot(symbol, db_path)
+    snap_age = snapshot.get("snapshot_age_seconds") if snapshot else None
+    logger.info(
+        "chain_analyzer sym=%s spot=%.2f spot_fetched_at=%s snap_age=%s",
+        symbol, spot, spot_fetched_at,
+        f"{snap_age:.1f}s" if snap_age is not None else "N/A",
+    )
     if not snapshot or not snapshot.get("oc"):
         logger.error(
             "DATA_FAULT chain_microstructure_analyzer sym=%s no_snapshot — returning synthetic fallback",
