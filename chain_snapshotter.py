@@ -168,6 +168,73 @@ def _fetch_and_persist(symbol: str, db_path: str) -> int:
     return len(rows)
 
 
+def get_latest_chain_snapshot(symbol: str, db_path: str = DEFAULT_DB_PATH) -> dict:
+    """Return the most recent chain snapshot for *symbol* from SQLite.
+
+    Returns a dict with keys:
+      "oc"      - {strike_str: {"ce": {...}, "pe": {...}}}
+      "expiry"  - expiry date string (YYYY-MM-DD)
+      "symbol"  - the symbol
+
+    Returns an empty dict when no snapshot exists for this symbol yet.
+    The returned dict is derived from the chain_snapshots table written by
+    the single-writer snapshotter; callers MUST NOT hit Dhan directly.
+    """
+    try:
+        conn = get_connection(db_path)
+        try:
+            # Find the latest timestamp for this symbol
+            cur = conn.execute(
+                "SELECT MAX(timestamp) FROM chain_snapshots WHERE symbol = ?",
+                (symbol,),
+            )
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                return {}
+
+            latest_ts = row[0]
+            cur = conn.execute(
+                """SELECT strike, option_type, expiry, ltp, oi, volume,
+                          iv, delta, theta, gamma, vega, security_id
+                   FROM chain_snapshots
+                   WHERE symbol = ? AND timestamp = ?""",
+                (symbol, latest_ts),
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return {}
+
+        oc: dict = {}
+        expiry = ""
+        for strike, opt_type, row_expiry, ltp, oi, volume, iv, delta, theta, gamma, vega, sec_id in rows:
+            expiry = row_expiry
+            k = str(int(strike)) if strike == int(strike) else str(strike)
+            if k not in oc:
+                oc[k] = {}
+            oc[k][opt_type.lower()] = {
+                "last_price": ltp,
+                "oi": oi,
+                "volume": volume,
+                "implied_volatility": iv,
+                "security_id": sec_id,
+                "greeks": {
+                    "delta": delta,
+                    "theta": theta,
+                    "gamma": gamma,
+                    "vega": vega,
+                },
+            }
+
+        return {"symbol": symbol, "expiry": expiry, "oc": oc}
+
+    except Exception as exc:
+        logger.error("get_latest_chain_snapshot sym=%s err=%s", symbol, exc)
+        return {}
+
+
 def poll_once(symbol: str, db_path: str = DEFAULT_DB_PATH) -> int:
     """Fetch one chain snapshot and persist. Returns rows inserted."""
     if not _ACCESS_TOKEN or not _CLIENT_ID:

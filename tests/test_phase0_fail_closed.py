@@ -199,38 +199,31 @@ class TestHunterFailClosed(unittest.TestCase):
 class TestChainSyntheticFlag(unittest.TestCase):
 
     def test_fallback_is_synthetic(self):
-        """When Dhan token is absent the function returns is_synthetic=True."""
-        with patch("chain_microstructure_analyzer.DHAN_ACCESS_TOKEN", ""), \
-             patch("chain_microstructure_analyzer.DHAN_CLIENT_ID", ""), \
+        """When the SQLite snapshot is empty (snapshotter not yet run), is_synthetic=True."""
+        with patch("chain_microstructure_analyzer.get_latest_chain_snapshot", return_value={}), \
              patch("chain_microstructure_analyzer.get_live_spots", return_value={"NIFTY": 23000.0}):
             from chain_microstructure_analyzer import analyze_option_chain_microstructure
             result = analyze_option_chain_microstructure("NIFTY")
         self.assertTrue(result["is_synthetic"])
 
     def test_live_feed_is_not_synthetic(self):
-        """When Dhan returns a valid oc, is_synthetic must be False."""
-        mock_expiry_resp = MagicMock()
-        mock_expiry_resp.status_code = 200
-        mock_expiry_resp.json.return_value = {"data": ["2026-01-09", "2026-01-16"]}
-
-        mock_oc_resp = MagicMock()
-        mock_oc_resp.status_code = 200
-        mock_oc_resp.json.return_value = {
-            "data": {
-                "last_price": 23000.0,
-                "oc": {
-                    "23000.000000": {
-                        "ce": {"oi": 1000, "last_price": 150.0},
-                        "pe": {"oi": 900, "last_price": 140.0}
-                    }
+        """When the SQLite snapshot has a valid oc, is_synthetic must be False."""
+        mock_snapshot = {
+            "symbol": "NIFTY",
+            "expiry": "2026-01-09",
+            "oc": {
+                "23000": {
+                    "ce": {"last_price": 150.0, "oi": 1000, "volume": 500,
+                           "implied_volatility": 15.0, "security_id": 1001,
+                           "greeks": {"delta": 0.5, "theta": -0.1, "gamma": 0.01, "vega": 0.2}},
+                    "pe": {"last_price": 140.0, "oi": 900, "volume": 450,
+                           "implied_volatility": 14.0, "security_id": 1002,
+                           "greeks": {"delta": -0.5, "theta": -0.1, "gamma": 0.01, "vega": 0.2}},
                 }
-            }
+            },
         }
-
-        with patch("chain_microstructure_analyzer.DHAN_ACCESS_TOKEN", "fake_token"), \
-             patch("chain_microstructure_analyzer.DHAN_CLIENT_ID", "fake_client"), \
-             patch("chain_microstructure_analyzer.get_live_spots", return_value={"NIFTY": 23000.0}), \
-             patch("requests.post", side_effect=[mock_expiry_resp, mock_oc_resp]):
+        with patch("chain_microstructure_analyzer.get_latest_chain_snapshot", return_value=mock_snapshot), \
+             patch("chain_microstructure_analyzer.get_live_spots", return_value={"NIFTY": 23000.0}):
             from chain_microstructure_analyzer import analyze_option_chain_microstructure
             result = analyze_option_chain_microstructure("NIFTY")
 
@@ -244,7 +237,11 @@ class TestChainSyntheticFlag(unittest.TestCase):
 class TestExpiryRollover(unittest.TestCase):
 
     def test_post_close_rollover_uses_index_1(self):
-        """Post-market rollover must set active_expiry = exp_list[1] (a string)."""
+        """Post-market rollover in chain_snapshotter._fetch_and_persist must
+        set active_expiry = exp_list[1] (a string), not the raw list."""
+        import chain_snapshotter
+        import tempfile
+
         exp_list = ["2026-01-05", "2026-01-09", "2026-01-16"]
 
         mock_expiry_resp = MagicMock()
@@ -258,8 +255,12 @@ class TestExpiryRollover(unittest.TestCase):
                 "last_price": 23000.0,
                 "oc": {
                     "23000.000000": {
-                        "ce": {"oi": 500, "last_price": 120.0},
-                        "pe": {"oi": 500, "last_price": 110.0}
+                        "ce": {"oi": 500, "last_price": 120.0,
+                               "implied_volatility": 15.0, "security_id": 1001,
+                               "greeks": {}},
+                        "pe": {"oi": 500, "last_price": 110.0,
+                               "implied_volatility": 14.0, "security_id": 1002,
+                               "greeks": {}}
                     }
                 }
             }
@@ -267,25 +268,28 @@ class TestExpiryRollover(unittest.TestCase):
 
         called_expiries = []
 
-        def capture_post(url, **kwargs):
+        def capture_post(url, headers=None, json=None, timeout=None):
             if "expirylist" in url:
                 return mock_expiry_resp
-            payload = kwargs.get("json", {})
-            called_expiries.append(payload.get("Expiry"))
+            called_expiries.append((json or {}).get("Expiry"))
             return mock_oc_resp
 
-        # Simulate 15:45 IST (past close) on 2026-01-05
-        past_close = datetime.datetime(2026, 1, 5, 15, 45)
+        # Simulate 15:45 IST on 2026-01-05 (past close, same day as exp_list[0])
+        from zoneinfo import ZoneInfo
+        IST = ZoneInfo("Asia/Kolkata")
+        past_close_ist = datetime.datetime(2026, 1, 5, 15, 45, tzinfo=IST)
 
-        with patch("chain_microstructure_analyzer.DHAN_ACCESS_TOKEN", "token"), \
-             patch("chain_microstructure_analyzer.DHAN_CLIENT_ID", "client"), \
-             patch("chain_microstructure_analyzer.get_live_spots", return_value={"NIFTY": 23000.0}), \
-             patch("chain_microstructure_analyzer.datetime") as mock_dt, \
-             patch("requests.post", side_effect=capture_post):
-            mock_dt.datetime.now.return_value = past_close
-            mock_dt.datetime.strptime = datetime.datetime.strptime
-            from chain_microstructure_analyzer import analyze_option_chain_microstructure
-            result = analyze_option_chain_microstructure("NIFTY")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            from db_init import init_db
+            init_db(db_path)
+
+            with patch.object(chain_snapshotter, "_ACCESS_TOKEN", "token"), \
+                 patch.object(chain_snapshotter, "_CLIENT_ID", "client"), \
+                 patch("chain_snapshotter.requests.post", side_effect=capture_post), \
+                 patch("chain_snapshotter.datetime") as mock_dt:
+                mock_dt.datetime.now.return_value = past_close_ist
+                chain_snapshotter._fetch_and_persist("NIFTY", db_path)
 
         # The expiry sent to the OC call must be exp_list[1], not the raw list
         self.assertTrue(len(called_expiries) > 0, "No OC call was made")
