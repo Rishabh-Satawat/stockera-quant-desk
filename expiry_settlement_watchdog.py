@@ -1,38 +1,79 @@
 import os
 import re
 import json
+import logging
 from datetime import datetime
 import requests
 from dotenv import load_dotenv
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
 # 1. Load Secrets
 load_dotenv(r"C:\kite-agent\secrets\telegram.env")
+load_dotenv(r"C:\kite-agent\secrets\dhan.env")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8814895777:AAFrGfSdIM1fW7HeHg9yIeFjOXqOMyg9F7s")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1337295028")
+DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "")
+DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
 
 LEDGER_PATH = r"C:\kite-agent\trades_ledger.json"
 
-# Approximate reference spot prices if live feed is unavailable during off-market hours
-BENCHMARK_SPOTS = {
-    "NIFTY": 23120.0,
-    "SENSEX": 74450.0,
-    "BANKNIFTY": 55750.0
-}
+# P0.7: BENCHMARK_SPOTS removed — live spot is mandatory for STT hazard assessment.
+
+SCRIP_MAP = {"NIFTY": 13, "BANKNIFTY": 25, "FINNIFTY": 27, "SENSEX": 51}
+
+
+def fetch_live_spot(symbol: str):
+    """Returns (spot_price, is_synthetic). is_synthetic=True means feed failed."""
+    # Prefer the shared live spot service
+    try:
+        from live_spot_service import get_live_spots
+        spots = get_live_spots()
+        s = spots.get(symbol.upper())
+        if s and float(s) > 0:
+            return float(s), False
+    except Exception as exc:
+        logger.error("DATA_FAULT fetch_live_spot sym=%s live_spot_service err=%s", symbol, exc)
+
+    # Fallback: query Dhan option chain for last_price
+    scrip_id = SCRIP_MAP.get(symbol.upper(), 13)
+    try:
+        h = {
+            "access-token": DHAN_ACCESS_TOKEN,
+            "client-id": DHAN_CLIENT_ID,
+            "Content-Type": "application/json"
+        }
+        r = requests.post(
+            "https://api.dhan.co/v2/optionchain",
+            headers=h,
+            json={"UnderlyingScrip": scrip_id, "UnderlyingSeg": "IDX_I"},
+            timeout=5
+        )
+        if r.status_code == 200:
+            lp = float(r.json().get("data", {}).get("last_price", 0.0))
+            if lp > 0:
+                return lp, False
+    except Exception as exc:
+        logger.error("DATA_FAULT fetch_live_spot sym=%s dhan_fallback err=%s", symbol, exc)
+
+    logger.error("DATA_FAULT fetch_live_spot sym=%s all_feeds_failed is_synthetic=True", symbol)
+    return None, True
+
 
 def parse_contract_details(contract_str, default_symbol="NIFTY"):
-    """Extracts underlying, strike, and option type (CE/PE) from contract string."""
     symbol = default_symbol.upper()
     for s in ["SENSEX", "BANKNIFTY", "NIFTY"]:
         if s in contract_str.upper():
             symbol = s
             break
-
     match = re.search(r"(\d{4,6})\s*(CE|PE)", contract_str.upper())
     if match:
         strike = float(match.group(1))
         opt_type = match.group(2)
         return symbol, strike, opt_type
     return symbol, None, None
+
 
 def evaluate_stt_hazard(trade, current_spot):
     """
@@ -47,10 +88,9 @@ def evaluate_stt_hazard(trade, current_spot):
     if not strike or not opt_type:
         return "UNKNOWN", 0.0, 0.0
 
-    # Calculate Intrinsic Value
     if opt_type == "CE":
         intrinsic = max(0.0, current_spot - strike)
-    else:  # PE
+    else:
         intrinsic = max(0.0, strike - current_spot)
 
     is_itm = intrinsic > 0
@@ -59,6 +99,7 @@ def evaluate_stt_hazard(trade, current_spot):
 
     status_tag = "ITM_HAZARD" if (is_itm and action == "BUY") else ("ITM_PROFIT" if is_itm else "OTM_SAFE")
     return status_tag, intrinsic, est_stt
+
 
 def run_settlement_watchdog(dry_run=False):
     if not os.path.exists(LEDGER_PATH):
@@ -84,7 +125,21 @@ def run_settlement_watchdog(dry_run=False):
 
     for t in active_trades:
         symbol = t.get("symbol", "NIFTY").upper()
-        spot = BENCHMARK_SPOTS.get(symbol, 23000.0)
+
+        # P0.7: Fetch live spot — never use static BENCHMARK_SPOTS constants.
+        spot, is_synthetic = fetch_live_spot(symbol)
+
+        if is_synthetic or spot is None:
+            logger.error(
+                "DATA_FAULT run_settlement_watchdog sym=%s live_spot_unavailable is_synthetic=True", symbol
+            )
+            print(f"⚠️ [{t.get('trade_id', 'TRD')}] DATA_FAULT: live spot unavailable for {symbol}. "
+                  f"Skipping STT assessment — manual review required.")
+            # Tag the trade so downstream tools know the exit was assessed without live data
+            if not dry_run:
+                t["is_synthetic"] = True
+            continue
+
         tag, intrinsic, stt = evaluate_stt_hazard(t, spot)
 
         trade_id = t.get("trade_id", "TRD")
@@ -104,6 +159,7 @@ def run_settlement_watchdog(dry_run=False):
             t["exit_time"] = "15:20:00"
             t["exit_price"] = exit_p
             t["exit_reason"] = "15:20_STT_DEFENSE_SQUAREOFF 🛡️" if tag == "ITM_HAZARD" else "15:20_THETA_HARVEST ⏰"
+            t["is_synthetic"] = False  # P0.7: exit was assessed with live spot
             squared_count += 1
 
     if not dry_run and squared_count > 0:
@@ -111,7 +167,6 @@ def run_settlement_watchdog(dry_run=False):
             json.dump(trades, f, indent=2)
         print(f"\n✅ {squared_count} legs auto-squared off to eliminate settlement risk.")
 
-        # If warnings exist, broadcast high-priority safety alert to Telegram
         if warnings:
             alert_text = (
                 "<b>🚨 EXPIRY STT DEFENSE INTERVENTION 🚨</b>\n"
@@ -126,9 +181,9 @@ def run_settlement_watchdog(dry_run=False):
                 timeout=10
             )
 
-        # Trigger final EOD card
         print("🔄 Triggering final EOD Telegram audit card...")
         os.system("python eod_ledger_reporter.py")
+
 
 if __name__ == "__main__":
     import sys
