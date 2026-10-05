@@ -15,12 +15,16 @@ logger = logging.getLogger(__name__)
 load_dotenv(r"C:\kite-agent\secrets\telegram.env")
 load_dotenv(r"C:\kite-agent\secrets\dhan.env")
 
-_tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-_tg_chat = os.getenv("TELEGRAM_CHAT_ID", "")
-if not _tg_token:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before starting the sentinel")
-TELEGRAM_BOT_TOKEN = _tg_token
-TELEGRAM_CHAT_ID = _tg_chat
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+def _require_telegram_token():
+    """Raise at call time if the token is absent — never at import time."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before starting the sentinel"
+        )
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
 
@@ -80,6 +84,7 @@ def fetch_dhan_chain_price(symbol, strike, opt_type):
 
 
 def send_telegram_alert(text):
+    _require_telegram_token()
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:

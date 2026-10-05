@@ -15,12 +15,16 @@ LEDGER_FILE = r"C:\kite-agent\trades_ledger.json"
 STATE_FILE = r"C:\kite-agent\hunter_state.json"
 
 load_dotenv(r"C:\kite-agent\secrets\telegram.env")
-_tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-_tg_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-if not _tg_token:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before starting the hunter")
-TELEGRAM_BOT_TOKEN = _tg_token
-TELEGRAM_CHAT_ID = _tg_chat
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+
+def _require_telegram_token():
+    """Raise at call time if the token is absent — never at import time."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before starting the hunter"
+        )
 
 # P0.1: Lot sizes — resolved dynamically; fallback dict only.
 # Never hardcode lot sizes in trading logic; use LOT_SIZES.get(sym) and abort
@@ -29,12 +33,12 @@ LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20, "FINNIFTY": 60}
 
 
 def send_telegram_alert(msg: str):
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
-        except Exception as e:
-            logger.warning("Telegram notice: %s", e)
+    _require_telegram_token()
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
+    except Exception as e:
+        logger.warning("Telegram notice: %s", e)
 
 
 def get_cooldown_state():

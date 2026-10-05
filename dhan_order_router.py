@@ -20,12 +20,16 @@ load_dotenv()
 
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "").strip()
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
-_tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-_tg_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-if not _tg_token:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before importing this module")
-TELEGRAM_BOT_TOKEN = _tg_token
-TELEGRAM_CHAT_ID = _tg_chat
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+
+def _require_telegram_token():
+    """Raise at call time if the token is absent — never at import time."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before importing this module"
+        )
 
 LEDGER_PATH = r"C:\kite-agent\trades_ledger.json"
 
@@ -125,7 +129,8 @@ def parse_leg_string(leg_str, default_sym="NIFTY"):
 
 
 def send_telegram_execution_alert(basket, order_ids, live=False):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    _require_telegram_token()
+    if not TELEGRAM_CHAT_ID:
         return False
 
     mode_tag = "🔴 LIVE DHAN HQ v2 FILL" if live else "🟢 PAPER TRADING SIMULATION"
