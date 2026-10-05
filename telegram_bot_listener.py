@@ -14,8 +14,12 @@ load_dotenv(r"C:\kite-agent\secrets\telegram.env")
 load_dotenv(r"C:\kite-agent\secrets\dhan.env")
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8814895777:AAFrGfSdIM1fW7HeHg9yIeFjOXqOMyg9F7s").strip()
-AUTHORIZED_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1337295028").strip()
+_tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+_tg_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+if not _tg_token:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before starting the bot listener")
+TELEGRAM_BOT_TOKEN = _tg_token
+AUTHORIZED_CHAT_ID = _tg_chat
 LEDGER_PATH = r"C:\kite-agent\trades_ledger.json"
 
 def send_reply(chat_id, text):

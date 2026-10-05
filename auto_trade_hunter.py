@@ -15,8 +15,12 @@ LEDGER_FILE = r"C:\kite-agent\trades_ledger.json"
 STATE_FILE = r"C:\kite-agent\hunter_state.json"
 
 load_dotenv(r"C:\kite-agent\secrets\telegram.env")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8814895777:AAFrGfSdIM1fW7HeHg9yIeFjOXqOMyg9F7s").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1337295028").strip()
+_tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+_tg_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+if not _tg_token:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before starting the hunter")
+TELEGRAM_BOT_TOKEN = _tg_token
+TELEGRAM_CHAT_ID = _tg_chat
 
 # P0.1: Lot sizes — resolved dynamically; fallback dict only.
 # Never hardcode lot sizes in trading logic; use LOT_SIZES.get(sym) and abort
@@ -155,7 +159,7 @@ def hunt_market_once():
             "regime": regime,
         })
 
-    # P0.2: Select best candidate after scanning all 4 (strongest regime signal).
+    # P0.2: Full scan complete — first-match selection (not scored ranking; Phase 3 will add scoring).
     naked_candidate = None
     hedged_candidate = None
     for c in candidates:

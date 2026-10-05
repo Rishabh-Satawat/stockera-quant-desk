@@ -15,8 +15,12 @@ logger = logging.getLogger(__name__)
 load_dotenv(r"C:\kite-agent\secrets\telegram.env")
 load_dotenv(r"C:\kite-agent\secrets\dhan.env")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8814895777:AAFrGfSdIM1fW7HeHg9yIeFjOXqOMyg9F7s")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1337295028")
+_tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+_tg_chat = os.getenv("TELEGRAM_CHAT_ID", "")
+if not _tg_token:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before starting the sentinel")
+TELEGRAM_BOT_TOKEN = _tg_token
+TELEGRAM_CHAT_ID = _tg_chat
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
 
@@ -27,6 +31,11 @@ SCRIP_MAP = {
     "BANKNIFTY": 25,
     "SENSEX": 51
 }
+
+# P0.11: consecutive failed ticks required before escalating to UNRESOLVED (≈30 s)
+DATA_FAULT_ESCALATION_TICKS = 10
+# IST time at which any active trade must be force-closed regardless
+STT_CUTOFF_HHMM = (15, 20)
 
 
 def parse_contract(contract_str, default_symbol="NIFTY"):
@@ -121,15 +130,52 @@ def run_sentinel(simulation=False):
                 ltp = fetch_dhan_chain_price(symbol, strike, opt_type)
 
             if ltp is None:
-                # P0.6: Live feed lost → mark UNRESOLVED, never simulate a win.
-                logger.error(
-                    "DATA_FAULT run_sentinel trade_id=%s live_feed_lost setting UNRESOLVED", trade_id
-                )
-                print(f"  ⚠️ {trade_id} ({contract}): DATA_FAULT live feed lost → UNRESOLVED")
-                t["status"] = "UNRESOLVED"
-                t["exit_reason"] = "DATA_FAULT_LIVE_FEED_LOST"
+                # P0.11: single tick drop must NOT orphan the position.
+                # Accumulate data_fault_ticks; escalate only after 10 consecutive
+                # failures (~30 s) OR once 15:20 IST has passed.
+                now_dt = datetime.now()
+                past_cutoff = (now_dt.hour, now_dt.minute) >= STT_CUTOFF_HHMM
+
+                prev_ticks = int(t.get("data_fault_ticks", 0))
+                new_ticks = prev_ticks + 1
+                t["data_fault"] = True
+                t["data_fault_ticks"] = new_ticks
+                if not t.get("data_fault_since"):
+                    t["data_fault_since"] = now_dt.isoformat()
+
+                if new_ticks >= DATA_FAULT_ESCALATION_TICKS or past_cutoff:
+                    reason = "DATA_FAULT_CUTOFF" if past_cutoff else "DATA_FAULT_10_TICKS"
+                    logger.error(
+                        "DATA_FAULT run_sentinel trade_id=%s ticks=%s setting UNRESOLVED reason=%s",
+                        trade_id, new_ticks, reason
+                    )
+                    print(f"  🔴 {trade_id} ({contract}): {reason} → UNRESOLVED after {new_ticks} failed ticks")
+                    t["status"] = "UNRESOLVED"
+                    t["exit_reason"] = reason
+                else:
+                    if new_ticks == 1:
+                        # Alert once on first failure
+                        send_telegram_alert(
+                            f"⚠️ DATA_FAULT: live feed lost for {trade_id} ({contract}). "
+                            f"Position still ACTIVE. Retrying... (tick 1/{DATA_FAULT_ESCALATION_TICKS})"
+                        )
+                    logger.warning(
+                        "DATA_FAULT run_sentinel trade_id=%s live_feed_lost tick=%s/%s status=ACTIVE",
+                        trade_id, new_ticks, DATA_FAULT_ESCALATION_TICKS
+                    )
+                    print(
+                        f"  ⚠️ {trade_id} ({contract}): DATA_FAULT tick {new_ticks}/{DATA_FAULT_ESCALATION_TICKS} "
+                        f"— still ACTIVE, retrying..."
+                    )
                 updated = True
                 continue
+
+            # P0.11: successful tick — clear any accumulated data_fault state
+            if t.get("data_fault"):
+                t["data_fault"] = False
+                t["data_fault_ticks"] = 0
+                t["data_fault_since"] = None
+                updated = True
 
             pnl_pts = round(ltp - entry if action == "BUY" else entry - ltp, 2)
             print(f"  • {trade_id} ({contract}): Entry: ₹{entry} | LTP: ₹{ltp} | Target: ₹{t1} | SL: ₹{sl}")
