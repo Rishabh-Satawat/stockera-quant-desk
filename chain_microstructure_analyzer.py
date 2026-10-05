@@ -1,15 +1,20 @@
-﻿import os
+import os
 import requests
 import json
 import datetime
+import logging
 from dotenv import load_dotenv
 from live_spot_service import get_live_spots
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 load_dotenv(r"C:\kite-agent\secrets\dhan.env")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "").strip()
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
 
 SCRIP_MAP = {"NIFTY": 13, "BANKNIFTY": 25, "FINNIFTY": 27, "SENSEX": 51}
+
 
 def analyze_option_chain_microstructure(symbol: str):
     spots = get_live_spots()
@@ -40,9 +45,9 @@ def analyze_option_chain_microstructure(symbol: str):
                 exp_list = r_exp.json().get("data", [])
                 if exp_list:
                     active_expiry = exp_list[0]
-                    # Post-market rollover if today's expiry is over
+                    # P0.4: Post-market rollover — assign exp_list[1], not the raw list.
                     if is_past_close and active_expiry <= today_str and len(exp_list) > 1:
-                        active_expiry = exp_list
+                        active_expiry = exp_list[1]
 
                     r_oc = requests.post(
                         "https://api.dhan.co/v2/optionchain",
@@ -98,12 +103,14 @@ def analyze_option_chain_microstructure(symbol: str):
                                 "call_wall": call_wall,
                                 "put_wall": put_wall,
                                 "raw_oc": oc,
-                                "status_mode": "LIVE_DHAN_FEED"
+                                "status_mode": "LIVE_DHAN_FEED",
+                                "is_synthetic": False,  # P0.3: live feed — real data
                             }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("DATA_FAULT chain_microstructure_analyzer sym=%s fetch_failed err=%s", symbol, exc)
 
-    # 2. Resilient Fallback (Ensures committee NEVER fails)
+    # P0.3: Fallback — mark synthetic=True so callers refuse to alert or trade.
+    logger.error("DATA_FAULT chain_microstructure_analyzer sym=%s returning_synthetic_fallback", symbol)
     return {
         "symbol": symbol,
         "expiry": "NEXT_ACTIVE_WEEKLY",
@@ -113,5 +120,6 @@ def analyze_option_chain_microstructure(symbol: str):
         "call_wall": atm + 3 * step,
         "put_wall": atm - 2 * step,
         "raw_oc": {},
-        "status_mode": "SESSION_CLOSING_SNAPSHOT"
+        "status_mode": "SESSION_CLOSING_SNAPSHOT",
+        "is_synthetic": True,  # P0.3: callers must refuse to alert/trade on this
     }
