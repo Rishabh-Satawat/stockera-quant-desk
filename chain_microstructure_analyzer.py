@@ -18,7 +18,7 @@ SCRIP_MAP = {"NIFTY": 13, "BANKNIFTY": 25, "FINNIFTY": 27, "SENSEX": 51}
 
 def analyze_option_chain_microstructure(symbol: str):
     spots = get_live_spots()
-    spot = spots.get(symbol, 23063.10 if symbol == "NIFTY" else (73580.54 if symbol == "SENSEX" else 55438.50))
+    spot = spots.get(symbol) or 0.0
     step = 100 if symbol in ["SENSEX", "BANKNIFTY"] else 50
     atm = int(round(spot / step) * step)
 
