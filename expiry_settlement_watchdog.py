@@ -12,8 +12,12 @@ logger = logging.getLogger(__name__)
 # 1. Load Secrets
 load_dotenv(r"C:\kite-agent\secrets\telegram.env")
 load_dotenv(r"C:\kite-agent\secrets\dhan.env")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8814895777:AAFrGfSdIM1fW7HeHg9yIeFjOXqOMyg9F7s")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1337295028")
+_tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+_tg_chat = os.getenv("TELEGRAM_CHAT_ID", "")
+if not _tg_token:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before running the watchdog")
+TELEGRAM_BOT_TOKEN = _tg_token
+TELEGRAM_CHAT_ID = _tg_chat
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
 

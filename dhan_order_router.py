@@ -20,8 +20,12 @@ load_dotenv()
 
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "").strip()
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8814895777:AAFrGfSdIM1fW7HeHg9yIeFjOXqOMyg9F7s").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1337295028").strip()
+_tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+_tg_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+if not _tg_token:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN env var is missing — load secrets/telegram.env before importing this module")
+TELEGRAM_BOT_TOKEN = _tg_token
+TELEGRAM_CHAT_ID = _tg_chat
 
 LEDGER_PATH = r"C:\kite-agent\trades_ledger.json"
 
@@ -35,11 +39,12 @@ EXCHANGE_SEGMENTS = {
 SCRIP_MAP = {"NIFTY": 13, "BANKNIFTY": 25, "FINNIFTY": 27, "SENSEX": 51}
 
 
-# P0.9: Resolve real numeric security_id from option chain — never use strike as proxy.
-def resolve_security_id(symbol: str, strike: float, opt_type: str):
+# P0.12: Fetch option chain ONCE per (symbol, expiry) — Dhan rate limit is 1 req/3 s.
+def fetch_option_chain(symbol: str, expiry_date: str = None) -> dict:
     """
-    Queries Dhan /v2/optionchain and returns the integer security_id for the leg.
-    Returns None if the ID cannot be verified — callers must hard-fail in that case.
+    Fetches Dhan /v2/optionchain once and returns the raw 'oc' dict.
+    expiry_date should be "YYYY-MM-DD"; if omitted, Dhan returns the nearest expiry.
+    Returns {} on any failure.
     """
     scrip_id = SCRIP_MAP.get(symbol.upper(), 13)
     h = {
@@ -47,29 +52,49 @@ def resolve_security_id(symbol: str, strike: float, opt_type: str):
         "client-id": DHAN_CLIENT_ID,
         "Content-Type": "application/json"
     }
+    payload = {"UnderlyingScrip": scrip_id, "UnderlyingSeg": "IDX_I"}
+    if expiry_date:
+        payload["Expiry"] = expiry_date
     try:
         r = requests.post(
             "https://api.dhan.co/v2/optionchain",
             headers=h,
-            json={"UnderlyingScrip": scrip_id, "UnderlyingSeg": "IDX_I"},
+            json=payload,
             timeout=5
         )
         if r.status_code == 200:
-            oc = r.json().get("data", {}).get("oc", {})
-            for k, v in oc.items():
-                try:
-                    if abs(float(k) - strike) < 0.5:
-                        leg_key = opt_type.lower()  # "ce" or "pe"
-                        sec_id = v.get(leg_key, {}).get("security_id")
-                        if sec_id is not None:
-                            return int(sec_id)
-                except Exception:
-                    continue
+            return r.json().get("data", {}).get("oc", {})
     except Exception as exc:
         logger.error(
-            "DATA_FAULT resolve_security_id sym=%s strike=%s opt=%s err=%s",
-            symbol, strike, opt_type, exc
+            "DATA_FAULT fetch_option_chain sym=%s expiry=%s err=%s",
+            symbol, expiry_date, exc
         )
+    return {}
+
+
+# P0.9 / P0.12: Resolve real numeric security_id from a pre-fetched option chain.
+def resolve_security_id(symbol: str, strike: float, opt_type: str, expiry_date: str = None, oc: dict = None):
+    """
+    Returns the integer security_id for the leg from the provided option chain cache.
+    If oc is None, fetches the chain (single call); callers should prefer passing the
+    pre-fetched oc so the whole basket uses exactly one API call.
+    Returns None if the ID cannot be verified — callers must hard-fail in that case.
+    """
+    if oc is None:
+        oc = fetch_option_chain(symbol, expiry_date)
+    for k, v in oc.items():
+        try:
+            if abs(float(k) - strike) < 0.5:
+                leg_key = opt_type.lower()  # "ce" or "pe"
+                sec_id = v.get(leg_key, {}).get("security_id")
+                if sec_id is not None:
+                    return int(sec_id)
+        except Exception:
+            continue
+    logger.error(
+        "DATA_FAULT resolve_security_id sym=%s strike=%s opt=%s expiry=%s not_found_in_chain",
+        symbol, strike, opt_type, expiry_date
+    )
     return None
 
 
@@ -136,32 +161,60 @@ def execute_basket(basket, live_mode=False):
     sym = basket.get("sym", "NIFTY")
     legs = basket.get("legs", [])
     lot_size = basket.get("lot", 65)
+    expiry_date = basket.get("expiry_date")  # P0.12: pass expiry so chain uses correct cycle
     order_ids = []
     fill_reports = []
 
-    for idx, leg_text in enumerate(legs):
-        leg_info = parse_leg_string(leg_text, default_sym=sym)
+    # P0.12: Fetch option chain ONCE for the entire basket to avoid Dhan rate limit
+    # (1 req / 3 s). Resolve all security IDs before placing any order.
+    if live_mode and DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID:
+        shared_oc = fetch_option_chain(sym, expiry_date)
+        if not shared_oc:
+            logger.error(
+                "DATA_FAULT execute_basket sym=%s expiry=%s option_chain_unavailable — basket ABORTED",
+                sym, expiry_date
+            )
+            return {
+                "status": "REJECTED",
+                "mode": "LIVE",
+                "orders": [],
+                "report": [f"ABORTED: option chain unavailable for {sym} expiry={expiry_date}"]
+            }
+
+        # Pre-resolve all security IDs — abort entire basket if any leg fails
+        leg_infos = [parse_leg_string(leg_text, default_sym=sym) for leg_text in legs]
+        resolved_ids = []
+        for leg_info in leg_infos:
+            sec_id = resolve_security_id(
+                leg_info["symbol"], leg_info["strike"], leg_info["opt_type"],
+                expiry_date=expiry_date, oc=shared_oc
+            )
+            if sec_id is None:
+                logger.error(
+                    "DATA_FAULT execute_basket sym=%s strike=%s opt=%s "
+                    "security_id_unresolved — ENTIRE BASKET ABORTED",
+                    leg_info["symbol"], leg_info["strike"], leg_info["opt_type"]
+                )
+                return {
+                    "status": "REJECTED",
+                    "mode": "LIVE",
+                    "orders": [],
+                    "report": [
+                        f"ABORTED: security_id unresolved for "
+                        f"{leg_info['symbol']} {leg_info['strike']} {leg_info['opt_type']}"
+                    ]
+                }
+            resolved_ids.append(sec_id)
+    else:
+        leg_infos = [parse_leg_string(leg_text, default_sym=sym) for leg_text in legs]
+        resolved_ids = [None] * len(leg_infos)
+
+    for idx, (leg_text, leg_info) in enumerate(zip(legs, leg_infos)):
         order_num = f"DHAN-ORD-{int(time.time())}-{idx+1}"
+        security_id = resolved_ids[idx]
 
         if live_mode and DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID:
-            # P0.9: Resolve real numeric security_id before submitting the order.
-            security_id = resolve_security_id(
-                leg_info["symbol"], leg_info["strike"], leg_info["opt_type"]
-            )
-            if security_id is None:
-                # P0.9: Hard-fail — never log as ACTIVE if security_id is unverified.
-                msg = (
-                    f"DATA_FAULT execute_basket sym={leg_info['symbol']} "
-                    f"strike={leg_info['strike']} opt={leg_info['opt_type']} "
-                    f"security_id_unresolved — order REJECTED, NOT logged as ACTIVE"
-                )
-                logger.error(msg)
-                order_ids.append(f"{order_num}-REJECTED_NO_SECID")
-                fill_reports.append(
-                    f"REJECTED {leg_info['action']} {leg_info['strike']} "
-                    f"{leg_info['opt_type']} — security_id unverified (DATA_FAULT)"
-                )
-                continue
+            # security_id is already verified above; execution proceeds directly.
 
             # LIVE EXECUTION VIA DHAN HQ v2 API
             url = "https://api.dhan.co/v2/orders"
@@ -216,10 +269,11 @@ def execute_basket(basket, live_mode=False):
                 f"@ ₹{leg_info['price']} (Simulated Fill)"
             )
 
-    # Only record to ledger if at least one leg was successfully dispatched live,
-    # or if running in paper-trading mode. P0.9: never mark ACTIVE on full rejection.
+    # P0.12 / Cleanup: Record to ledger only if ALL legs succeeded in live mode.
+    # A partial fill leaves some legs unhedged — never log that basket as ACTIVE.
     live_successes = [o for o in order_ids if not any(tag in o for tag in ["REJECTED", "OFFLINE", "FAILED"])]
-    if not live_mode or live_successes:
+    all_filled = len(live_successes) == len(legs)
+    if not live_mode or all_filled:
         try:
             from cockpit_ledger_bridge import auto_record_broadcasted_basket
             auto_record_broadcasted_basket(
@@ -241,7 +295,7 @@ def execute_basket(basket, live_mode=False):
     send_telegram_execution_alert(basket, order_ids, live=live_mode)
 
     return {
-        "status": "SUCCESS" if live_successes or not live_mode else "REJECTED",
+        "status": "SUCCESS" if all_filled or not live_mode else "PARTIAL_FILL_REJECTED",
         "mode": "LIVE" if live_mode else "PAPER_TRADING",
         "orders": order_ids,
         "report": fill_reports

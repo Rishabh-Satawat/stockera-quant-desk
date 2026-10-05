@@ -59,11 +59,7 @@ def get_live_spots():
         except Exception:
             pass
 
-    # Safety fallbacks if offline
-    if spots["NIFTY"] <= 0: spots["NIFTY"] = 25820.0
-    if spots["BANKNIFTY"] <= 0: spots["BANKNIFTY"] = 54150.0
-    if spots["SENSEX"] <= 0: spots["SENSEX"] = 84250.0
-
+    # P0.10: Never return a hardcoded constant — leave zeros for callers to reject.
     return spots
 
 if __name__ == "__main__":
