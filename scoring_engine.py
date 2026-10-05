@@ -1,12 +1,13 @@
-"""Composite Confluence Scoring Engine — Phase 1C.
+"""Composite Confluence Scoring Engine — Phase 1C / Phase 1D.
 
 Scores every evaluated PlaybookSignal 0–100 using 5 weighted pillars:
 
-  Pillar 1  Regime & Structure Alignment     30 pts
-  Pillar 2  Microstructure & Order Flow      25 pts
-  Pillar 3  Volatility & Expected Move       20 pts
-  Pillar 4  Risk:Reward Metric               15 pts
-  Pillar 5  Data Quality & Freshness         10 pts
+  Pillar 1  Regime & Structure Alignment          30 pts
+  Pillar 2  PCR & Strike Concentration            25 pts
+             (TODO Phase 3: attach aggressor CVD delta-flow here)
+  Pillar 3  Volatility & Expected Move            20 pts
+  Pillar 4  Risk:Reward Metric                    15 pts
+  Pillar 5  Data Quality & Freshness              10 pts
 
 Gating rules:
   ≥ 80  Tier 1 — emit alert / dispatch trade
@@ -81,9 +82,11 @@ def _score_regime_structure(signal: PlaybookSignal) -> float:
 
 
 def _score_microstructure(signal: PlaybookSignal) -> float:
-    """Pillar 2: Microstructure & Order Flow — max 25 pts.
+    """Pillar 2: PCR & Strike Concentration — max 25 pts.
 
-    PCR confirmation and corridor placement.
+    PCR direction confirmation and spot position within the call/put-wall corridor.
+    TODO Phase 3: extend with aggressor CVD delta-flow signal when order_flow_cvd_engine
+    provides a tick-level net delta delta feed.
     """
     pts = 0.0
     pcr = signal.pcr
@@ -300,24 +303,61 @@ def rank_and_filter(
     # Sort descending by score
     sorted_candidates = sorted(candidates, key=lambda x: x[1]["score"], reverse=True)
 
-    # Anti-correlation: deduplicate NIFTY / SENSEX identical directional signals
-    correlated_pair = frozenset(("NIFTY", "SENSEX"))
-    seen_correlated_direction: dict[str, tuple[PlaybookSignal, dict]] = {}
+    # Anti-correlation filter: prevent doubled sector risk by deduplicating
+    # same-direction signals within each correlated group.
+    #
+    # Group A: NIFTY ↔ SENSEX  (broad-market indices — near-identical composition)
+    # Group B: NIFTY ↔ BANKNIFTY  (banking sector drives ~35% of NIFTY weight)
+    #
+    # Within each group, if two PB1 directional signals share the same direction,
+    # only the highest-scoring one is kept.
+    _CORR_GROUPS = [
+        frozenset(("NIFTY", "SENSEX")),
+        frozenset(("NIFTY", "BANKNIFTY")),
+    ]
+
+    # Map each (group_index, direction) → the best-scoring (sig, score_result) so far
+    seen: dict[tuple[int, str], tuple[PlaybookSignal, dict]] = {}
+    # Track which symbols we already emitted, so we don't double-count NIFTY
+    # if it wins both group A and group B competitions.
     filtered: list[tuple[PlaybookSignal, dict]] = []
+    dropped_ids: set[int] = set()
 
     for sig, score_result in sorted_candidates:
-        if sig.symbol in correlated_pair and sig.playbook_id == "PB1":
-            key = sig.direction
-            if key in seen_correlated_direction:
-                # Already have a correlated directional signal — skip the lower-scoring one
-                logger.info(
-                    "anti_correlation_filter: dropping %s %s (score=%d) — %s already selected",
-                    sig.symbol, sig.direction, score_result["score"],
-                    seen_correlated_direction[key][0].symbol,
-                )
-                continue
-            seen_correlated_direction[key] = (sig, score_result)
-        filtered.append((sig, score_result))
+        if id(sig) in dropped_ids:
+            continue
+        if sig.playbook_id == "PB1":
+            for grp_idx, grp in enumerate(_CORR_GROUPS):
+                if sig.symbol in grp:
+                    key = (grp_idx, sig.direction)
+                    if key in seen:
+                        prev_sig, prev_sr = seen[key]
+                        if score_result["score"] >= prev_sr["score"]:
+                            # Current signal is better — drop the previously-added one
+                            dropped_ids.add(id(prev_sig))
+                            filtered = [(s, sr) for s, sr in filtered if id(s) != id(prev_sig)]
+                            seen[key] = (sig, score_result)
+                            logger.info(
+                                "anti_correlation_filter: grp=%d dropping %s %s (score=%d) "
+                                "— %s score=%d is higher",
+                                grp_idx, prev_sig.symbol, prev_sig.direction, prev_sr["score"],
+                                sig.symbol, score_result["score"],
+                            )
+                        else:
+                            # Current signal is worse — drop it
+                            dropped_ids.add(id(sig))
+                            logger.info(
+                                "anti_correlation_filter: grp=%d dropping %s %s (score=%d) "
+                                "— %s already selected (score=%d)",
+                                grp_idx, sig.symbol, sig.direction, score_result["score"],
+                                prev_sig.symbol, prev_sr["score"],
+                            )
+                            break
+                    else:
+                        seen[key] = (sig, score_result)
+
+        if id(sig) not in dropped_ids:
+            filtered.append((sig, score_result))
 
     return filtered
 
@@ -328,7 +368,7 @@ def format_confluence_breakdown(signal: PlaybookSignal, score_result: dict) -> s
     lines = [
         f"📊 *Confluence Score: {score_result['score']}/100* (Tier {score_result['tier']})",
         f"  • Regime & Structure:    {b['regime_structure']:.0f}/30",
-        f"  • Microstructure/Flow:   {b['microstructure']:.0f}/25",
+        f"  • PCR & Strike Conc.:    {b['microstructure']:.0f}/25",
         f"  • Volatility / EM:       {b['volatility_em']:.0f}/20",
         f"  • Risk:Reward:           {b['risk_reward']:.0f}/15",
         f"  • Data Quality:          {b['data_quality']:.0f}/10",

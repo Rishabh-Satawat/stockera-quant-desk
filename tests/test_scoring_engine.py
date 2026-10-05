@@ -337,8 +337,9 @@ class TestRankAndFilter:
         return {"score": score, "tier": 1, "raw_score": float(score), "breakdown": {}}
 
     def test_sorted_descending(self):
+        # Use NIFTY + FINNIFTY: different correlated groups, so both kept
         s1 = _make_signal(symbol="NIFTY")
-        s2 = _make_signal(symbol="BANKNIFTY")
+        s2 = _make_signal(symbol="FINNIFTY")
         candidates = [(s1, self._sc(70)), (s2, self._sc(85))]
         result = rank_and_filter(candidates)
         assert result[0][1]["score"] == 85

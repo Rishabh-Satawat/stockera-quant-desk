@@ -84,6 +84,49 @@ CREATE TABLE IF NOT EXISTS iv_history (
 
 CREATE INDEX IF NOT EXISTS idx_iv_history_lookup
     ON iv_history (symbol, trade_date);
+
+CREATE TABLE IF NOT EXISTS candidates (
+    candidate_id      TEXT PRIMARY KEY,
+    ts_signal         TEXT NOT NULL,        -- ISO-8601 UTC timestamp of signal
+    symbol            TEXT NOT NULL,
+    expiry            TEXT NOT NULL,
+    playbook_id       TEXT NOT NULL,
+    tier              INTEGER NOT NULL,     -- 1, 2, or 0
+    score             REAL NOT NULL,
+    score_breakdown   JSON NOT NULL,
+    vol_regime        TEXT NOT NULL,
+    vol_provisional   INTEGER NOT NULL,     -- 0 or 1
+    direction_label   TEXT NOT NULL,
+    direction_score   INTEGER NOT NULL,
+    spot              REAL NOT NULL,
+    vwap              REAL,
+    pcr               REAL,
+    max_pain          REAL,
+    call_wall         REAL,
+    put_wall          REAL,
+    gamma_flip        REAL,
+    net_gex           REAL,
+    pin_score         REAL,
+    ivr               REAL,
+    ivp               REAL,
+    vrp               REAL,
+    or_high           REAL,
+    or_low            REAL,
+    dispatched        INTEGER NOT NULL,     -- 1 if trade was sent to broker, 0 otherwise
+    skip_reason       TEXT,
+    -- outcome fields populated by outcome_labeller.py (after the session)
+    outcome_label     TEXT,                 -- WINNER / LOSER / EXPIRED / NULL
+    pnl_points        REAL,
+    option_pnl_pct    REAL,
+    mae_points        REAL,
+    labelled_at       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidates_ts
+    ON candidates (ts_signal);
+
+CREATE INDEX IF NOT EXISTS idx_candidates_symbol
+    ON candidates (symbol, playbook_id);
 """
 
 

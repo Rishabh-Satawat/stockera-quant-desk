@@ -163,6 +163,45 @@ def send_telegram_card(text):
     except Exception as e:
         return False, str(e)
 
+def _check_iv_stagnation(db_path: str, lookback_sessions: int = 3) -> None:
+    """Warn when iv_history hasn't grown for `lookback_sessions` consecutive trading sessions.
+
+    Reads the most recent `lookback_sessions` distinct trade_dates for each symbol;
+    if none were added in the last N sessions, logs a WARNING so operators know
+    that IVR/IVP calculations will degrade.
+    """
+    try:
+        from db_init import DEFAULT_DB_PATH as _DEFAULT_DB_PATH, init_db
+        import sqlite3
+        from datetime import date, timedelta
+
+        db_path = db_path or _DEFAULT_DB_PATH
+        init_db(db_path)
+
+        conn = sqlite3.connect(db_path, timeout=10)
+        try:
+            # Build a list of the last N calendar days (approximate trading sessions)
+            today = date.today().isoformat()
+            cutoff = (date.today() - timedelta(days=lookback_sessions * 2)).isoformat()
+
+            for sym in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"):
+                rows = conn.execute(
+                    "SELECT COUNT(*) FROM iv_history WHERE symbol=? AND trade_date >= ? AND trade_date <= ?",
+                    (sym, cutoff, today),
+                ).fetchone()
+                count = rows[0] if rows else 0
+                if count == 0:
+                    logger.warning(
+                        "IV_STAGNATION: no iv_history rows for %s in last %d sessions — "
+                        "IVR/IVP will degrade.  Ensure record_eod_iv() is being called at 15:30 IST.",
+                        sym, lookback_sessions,
+                    )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("_check_iv_stagnation: failed — %s", exc)
+
+
 def _record_eod_ivs_all_indices(db_path: str = None) -> None:
     """Call volatility_engine.record_eod_iv for all 4 indices at 15:30 IST close.
 
@@ -212,6 +251,7 @@ def main():
     # At 15:30 IST: persist today's ATM IV for all 4 indices into iv_history.
     # This is what makes IVR/IVP functional after the first 20 trading sessions.
     _record_eod_ivs_all_indices()
+    _check_iv_stagnation(None)
 
     metrics = calculate_eod_metrics(trades)
 
