@@ -87,29 +87,34 @@ def _insert_bar(
 
 class TestIVR:
     def test_ivr_correct_range(self):
-        from volatility_engine import compute_ivr
-        ivs = [0.15, 0.18, 0.20, 0.22, 0.25]
+        from volatility_engine import compute_ivr, MIN_LOOKBACK_SESSIONS
+        # Pad to MIN_LOOKBACK_SESSIONS with a filler below the range
+        base = [0.12] * (MIN_LOOKBACK_SESSIONS - 5)
+        ivs = base + [0.15, 0.18, 0.20, 0.22, 0.25]
         ivr = compute_ivr(ivs)
         assert ivr is not None
         assert 0.0 <= ivr <= 100.0
 
     def test_ivr_current_is_max(self):
-        from volatility_engine import compute_ivr
-        ivs = [0.15, 0.20, 0.30]
+        from volatility_engine import compute_ivr, MIN_LOOKBACK_SESSIONS
+        # current (last) = 0.30 = max; pad to minimum required length
+        ivs = [0.10] * (MIN_LOOKBACK_SESSIONS - 3) + [0.15, 0.20, 0.30]
         ivr = compute_ivr(ivs)
         assert ivr is not None
         assert abs(ivr - 100.0) < 1e-9
 
     def test_ivr_current_is_min(self):
-        from volatility_engine import compute_ivr
-        ivs = [0.30, 0.25, 0.15]
+        from volatility_engine import compute_ivr, MIN_LOOKBACK_SESSIONS
+        # current (last) = 0.15 = min; pad to minimum required length
+        ivs = [0.30] * (MIN_LOOKBACK_SESSIONS - 2) + [0.25, 0.15]
         ivr = compute_ivr(ivs)
         assert ivr is not None
         assert abs(ivr - 0.0) < 1e-9
 
     def test_ivr_midpoint(self):
-        from volatility_engine import compute_ivr
-        ivs = [0.10, 0.20, 0.15]  # current=0.15, min=0.10, max=0.20
+        from volatility_engine import compute_ivr, MIN_LOOKBACK_SESSIONS
+        # current=0.15, min=0.10, max=0.20 → IVR=50.0; pad to minimum length
+        ivs = [0.10] * (MIN_LOOKBACK_SESSIONS - 2) + [0.20, 0.15]
         ivr = compute_ivr(ivs)
         assert ivr is not None
         assert abs(ivr - 50.0) < 1e-9
@@ -124,6 +129,7 @@ class TestIVR:
 
     def test_ivr_none_when_min_equals_max(self):
         from volatility_engine import compute_ivr
+        # Short list → None due to insufficient lookback
         assert compute_ivr([0.20, 0.20, 0.20]) is None
 
     def test_ivr_none_on_two_identical(self):
@@ -133,22 +139,25 @@ class TestIVR:
 
 class TestIVP:
     def test_ivp_correct_range(self):
-        from volatility_engine import compute_ivp
-        ivs = [0.10, 0.15, 0.18, 0.22, 0.25]
+        from volatility_engine import compute_ivp, MIN_LOOKBACK_SESSIONS
+        base = [0.12] * (MIN_LOOKBACK_SESSIONS - 5)
+        ivs = base + [0.10, 0.15, 0.18, 0.22, 0.25]
         ivp = compute_ivp(ivs)
         assert ivp is not None
         assert 0.0 <= ivp <= 100.0
 
     def test_ivp_current_above_all(self):
-        from volatility_engine import compute_ivp
-        ivs = [0.10, 0.12, 0.15, 0.30]  # current=0.30, all prior below
+        from volatility_engine import compute_ivp, MIN_LOOKBACK_SESSIONS
+        # current=0.30, all prior below → IVP=100.0; pad to minimum length
+        ivs = [0.10] * (MIN_LOOKBACK_SESSIONS - 4) + [0.10, 0.12, 0.15, 0.30]
         ivp = compute_ivp(ivs)
         assert ivp is not None
         assert abs(ivp - 100.0) < 1e-9
 
     def test_ivp_current_below_all(self):
-        from volatility_engine import compute_ivp
-        ivs = [0.30, 0.25, 0.20, 0.05]  # current=0.05, 0 prior below
+        from volatility_engine import compute_ivp, MIN_LOOKBACK_SESSIONS
+        # current=0.05, 0 prior below → IVP=0.0; pad to minimum length
+        ivs = [0.30] * (MIN_LOOKBACK_SESSIONS - 4) + [0.30, 0.25, 0.20, 0.05]
         ivp = compute_ivp(ivs)
         assert ivp is not None
         assert abs(ivp - 0.0) < 1e-9
@@ -200,19 +209,18 @@ class TestRV5m:
 
 class TestVolatilityEngineDB:
     def test_ivr_from_db(self, tmp_path):
-        from volatility_engine import compute_vol_metrics
+        """IVR is computed from iv_history daily rows, not intraday chain_snapshots."""
+        from volatility_engine import compute_vol_metrics, MIN_LOOKBACK_SESSIONS
+        from db_init import get_connection
         db_path = _make_db(tmp_path)
-        today = _today_ist()
-        conn = sqlite3.connect(db_path)
         symbol, expiry = "NIFTY", "2026-10-27"
 
-        # Insert multiple snapshots with varying IVs today
-        for i, iv_val in enumerate([0.15, 0.18, 0.22, 0.20]):
-            ts = f"{today}T09:{15+i*5:02d}:00+05:30"
-            for strike in [22000.0, 22100.0]:
-                _insert_snapshot(conn, symbol, expiry, strike, "CE", ts, iv=iv_val, delta=0.5)
-                _insert_snapshot(conn, symbol, expiry, strike, "PE", ts, iv=iv_val, delta=-0.5)
-        conn.commit()
+        # Insert MIN_LOOKBACK_SESSIONS daily iv_history rows (varied IVs)
+        conn = get_connection(db_path)
+        for i in range(MIN_LOOKBACK_SESSIONS):
+            date_str = f"2026-09-{i+1:02d}" if i < 30 else f"2026-10-{i-29:02d}"
+            atm_iv = 0.12 + i * 0.005  # rising IV series
+            _insert_iv_history(conn, symbol, date_str, expiry, atm_iv)
         conn.close()
 
         result = compute_vol_metrics(symbol, expiry, db_path)
@@ -870,3 +878,159 @@ class TestComputeRegime:
         db_path = _make_db(tmp_path)
         result = compute_regime("NIFTY", "2026-10-27", 22000.0, db_path)
         assert result["component_scores"]["basis"] == 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 1B.1 — IVR/IVP using iv_history (historical daily sessions)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _insert_iv_history(conn, symbol, trade_date, expiry, atm_iv, spot=22000.0):
+    conn.execute(
+        """INSERT OR REPLACE INTO iv_history
+           (symbol, trade_date, expiry, atm_iv, iv_25d_put, iv_25d_call, spot, source)
+           VALUES (?, ?, ?, ?, NULL, NULL, ?, 'EOD_SNAPSHOT')""",
+        (symbol, trade_date, expiry, atm_iv, spot),
+    )
+    conn.commit()
+
+
+class TestIVRHistoricalWindow:
+    """IVR/IVP must use iv_history daily rows, not intraday snapshots."""
+
+    def test_below_min_lookback_returns_none(self, tmp_path):
+        """< MIN_LOOKBACK_SESSIONS rows → compute_ivr/ivp return None."""
+        from volatility_engine import compute_ivr, compute_ivp, MIN_LOOKBACK_SESSIONS
+
+        # Provide fewer rows than the minimum
+        few_ivs = [0.12] * (MIN_LOOKBACK_SESSIONS - 1)
+        assert compute_ivr(few_ivs) is None
+        assert compute_ivp(few_ivs) is None
+
+    def test_exactly_min_lookback_does_not_return_none(self, tmp_path):
+        """Exactly MIN_LOOKBACK_SESSIONS rows → compute_ivr returns a value."""
+        from volatility_engine import compute_ivr, MIN_LOOKBACK_SESSIONS
+
+        # Build a series where last value > min
+        ivs = [0.12] * (MIN_LOOKBACK_SESSIONS - 1) + [0.20]
+        result = compute_ivr(ivs)
+        assert result is not None
+
+    def test_flat_iv_history_not_intraday_noise(self, tmp_path):
+        """A series spanning lo..hi with midpoint as the current value returns IVR = 50.0."""
+        from volatility_engine import compute_ivr, MIN_LOOKBACK_SESSIONS
+
+        lo, hi = 0.10, 0.30
+        mid = (lo + hi) / 2  # 0.20
+
+        # Series: half lo + (half-1) hi + 1 mid at the end
+        # Ensures min=lo, max=hi, current=mid → IVR = (mid-lo)/(hi-lo)*100 = 50.0
+        n = MIN_LOOKBACK_SESSIONS
+        half = n // 2
+        ivs_mid = [lo] * half + [hi] * (half - 1) + [mid]
+        assert len(ivs_mid) == n  # sanity-check length == 20
+
+        result = compute_ivr(ivs_mid)
+        assert result is not None
+        assert abs(result - 50.0) < 1e-6, f"Expected 50.0, got {result}"
+
+    def test_min_of_history_returns_ivr_zero(self, tmp_path):
+        """The minimum IV day must return IVR = 0.0."""
+        from volatility_engine import compute_ivr, MIN_LOOKBACK_SESSIONS
+
+        n = MIN_LOOKBACK_SESSIONS
+        # Last value is the minimum
+        ivs = [0.20] * (n - 1) + [0.10]
+        result = compute_ivr(ivs)
+        assert result is not None
+        assert abs(result - 0.0) < 1e-6, f"Expected 0.0, got {result}"
+
+    def test_max_of_history_returns_ivr_100(self, tmp_path):
+        """A high IV day (max of history) returns IVR = 100.0."""
+        from volatility_engine import compute_ivr, MIN_LOOKBACK_SESSIONS
+
+        n = MIN_LOOKBACK_SESSIONS
+        # Last value is the maximum
+        ivs = [0.10] * (n - 1) + [0.50]
+        result = compute_ivr(ivs)
+        assert result is not None
+        assert abs(result - 100.0) < 1e-6, f"Expected 100.0, got {result}"
+
+    def test_ivp_uses_full_history(self, tmp_path):
+        """IVP counts how many historical sessions had IV below the current IV."""
+        from volatility_engine import compute_ivp, MIN_LOOKBACK_SESSIONS
+
+        n = MIN_LOOKBACK_SESSIONS
+        # 10 values of 0.10, 9 values of 0.20, 1 current of 0.15 (last)
+        # Exactly half the prior n-1 values are below 0.15 → IVP = 50%
+        half = (n - 1) // 2
+        other_half = (n - 1) - half
+        ivs = [0.10] * half + [0.20] * other_half + [0.15]
+        result = compute_ivp(ivs)
+        assert result is not None
+        # half out of (n-1) prior values are below 0.15
+        expected = half / (n - 1) * 100.0
+        assert abs(result - expected) < 1e-6
+
+    def test_compute_vol_metrics_uses_iv_history(self, tmp_path):
+        """compute_vol_metrics reads from iv_history, not intraday chain_snapshots."""
+        from volatility_engine import compute_vol_metrics, MIN_LOOKBACK_SESSIONS
+        from db_init import init_db, get_connection
+
+        db_path = _make_db(tmp_path)
+        conn = get_connection(db_path)
+
+        # Insert enough daily history rows for IVR to be computable
+        n = MIN_LOOKBACK_SESSIONS
+        for i in range(n):
+            date_str = f"2026-{9:02d}-{i+1:02d}" if i < 30 else f"2026-10-{i-29:02d}"
+            atm_iv = 0.10 + i * 0.005  # rising IV series
+            _insert_iv_history(conn, "NIFTY", date_str, "2026-10-30", atm_iv)
+        conn.close()
+
+        result = compute_vol_metrics("NIFTY", "2026-10-30", db_path)
+        # With sufficient history, IVR should be non-None
+        assert result["ivr"] is not None, "IVR should be non-None with sufficient iv_history rows"
+        assert result["ivp"] is not None, "IVP should be non-None with sufficient iv_history rows"
+        # With rising IV series the last day should be IVR=100.0
+        assert abs(result["ivr"] - 100.0) < 1e-6
+
+    def test_record_eod_iv_writes_row(self, tmp_path):
+        """record_eod_iv writes a row to iv_history when chain data exists."""
+        from volatility_engine import record_eod_iv
+        from db_init import get_connection
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        db_path = _make_db(tmp_path)
+        today = datetime.datetime.now(tz=ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+        expiry = "2026-10-30"
+
+        # Insert a snapshot with a valid IV and delta=0.5 (ATM)
+        conn = get_connection(db_path)
+        _insert_snapshot(
+            conn, "NIFTY", expiry, 22000.0, "CE",
+            ts=f"{today}T15:29:00",
+            iv=0.18, delta=0.50, gamma=0.001,
+        )
+        conn.commit()
+        conn.close()
+
+        result = record_eod_iv("NIFTY", expiry, db_path)
+        assert result is True
+
+        conn = get_connection(db_path)
+        row = conn.execute(
+            "SELECT atm_iv, trade_date FROM iv_history WHERE symbol='NIFTY' AND trade_date=?",
+            (today,),
+        ).fetchone()
+        conn.close()
+        assert row is not None, "iv_history row should have been written"
+        assert abs(row[0] - 0.18) < 1e-6
+
+    def test_record_eod_iv_returns_false_without_snapshot(self, tmp_path):
+        """record_eod_iv returns False when no chain data is present."""
+        from volatility_engine import record_eod_iv
+
+        db_path = _make_db(tmp_path)
+        result = record_eod_iv("NIFTY", "2026-10-30", db_path)
+        assert result is False

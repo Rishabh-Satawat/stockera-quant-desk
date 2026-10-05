@@ -7,6 +7,8 @@ import requests
 from dotenv import load_dotenv
 from chain_microstructure_analyzer import analyze_option_chain_microstructure
 from market_hours_gate import is_market_open  # P0.1
+from regime_engine import compute_regime, get_playbook
+from db_init import DEFAULT_DB_PATH
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -172,6 +174,37 @@ def hunt_market_once():
         if c["regime"] == "RANGE_BOUND" and hedged_candidate is None:
             hedged_candidate = c
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Regime gate: consult regime_engine before emitting any signal.
+    # A playbook not permitted in the current regime is blocked and logged.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    _BEARISH_PLAYBOOKS = {"LONG_PUT", "LONG_PUT_SPREAD", "BEAR_PUT_SPREAD"}
+    _BULLISH_PLAYBOOKS = {"LONG_CALL", "LONG_CALL_SPREAD", "BULL_CALL_SPREAD"}
+    _RANGE_PLAYBOOKS = {"IRON_CONDOR", "SHORT_STRANGLE"}
+
+    def _check_regime_gate(candidate, required_playbooks, db_path=DEFAULT_DB_PATH):
+        """Return (allowed: bool, regime_dict, playbook: str).
+
+        Computes the live regime for the candidate and checks whether the
+        candidate's intended playbook family is permitted.
+        """
+        try:
+            reg = compute_regime(
+                candidate["sym"],
+                candidate["expiry"],
+                candidate["spot"],
+                db_path=db_path,
+            )
+        except Exception as exc:
+            logger.warning("regime_gate: compute_regime raised %s — blocking as REGIME_DATA_FAULT", exc)
+            return False, {}, "REGIME_DATA_FAULT"
+
+        playbook = reg.get("playbook", "NO_TRADE")
+        if playbook in required_playbooks:
+            return True, reg, playbook
+        return False, reg, playbook
+
     # --- A. NAKED DIRECTIONAL BOOK ---
     if naked_candidate and len(naked_trades) < 3:
         c = naked_candidate
@@ -181,32 +214,49 @@ def hunt_market_once():
         max_pain, call_wall, put_wall = c["max_pain"], c["call_wall"], c["put_wall"]
 
         if regime == "BEARISH_EXPANSION":
-            strike = atm
-            opt_price = get_strike_ltp(oc, strike, "PE")
-            # P0.5: Abort on missing price — never trade blind.
-            if opt_price is None:
-                logger.error("DATA_FAULT hunt_market_once sym=%s BEARISH_EXPANSION PE ltp=None aborting", sym)
-                print(f"   🚫 {sym} NAKED PE: DATA_FAULT ltp unavailable — trade aborted.")
+            # Regime gate: block if the vol-adjusted playbook is not bearish.
+            allowed, reg_data, playbook = _check_regime_gate(c, _BEARISH_PLAYBOOKS)
+            if not allowed:
+                reason = (
+                    f"{reg_data.get('direction_label','?')} / "
+                    f"{reg_data.get('vol_regime','?')} / {playbook}"
+                )
+                logger.info(
+                    "REGIME_GATED: sym=%s book=NAKED reason=%s playbook=%s",
+                    sym, reason, playbook,
+                )
+                print(f"   🚦 {sym} NAKED PE: REGIME_GATED ({reason}) — signal suppressed.")
             else:
-                sl = round(opt_price * 0.80, 2)
-                t1 = round(opt_price * 1.25, 2)
-                t2 = round(opt_price * 1.50, 2)
-                trade_id = f"{today_tag}-NAKED-{len(naked_trades)+1:02d}"
-                contract = f"{sym} {strike} PE"
-                new_trade = {
-                    "trade_id": trade_id, "book": "NAKED", "symbol": sym,
-                    "contract": contract, "action": "BUY",
-                    "strategy": "Bearish Put Momentum (Downside Expansion)",
-                    "qty": lot, "entry_time": now_str, "entry_price": opt_price,
-                    "stop_loss": sl, "target_1": t1, "target_2": t2,
-                    "status": "ACTIVE", "exit_time": None, "exit_price": None,
-                    "exit_reason": None, "margin_deployed": round(opt_price * lot, 2)
-                }
-                trades.append(new_trade)
-                _write_ledger(trades, LEDGER_FILE)
-                cooldowns[sym] = time.time()
-                save_cooldown_state(cooldowns)
-                msg = f"""🚨 *STOCKERA QUANT: NAKED DIRECTIONAL BUY ALERT* 🚨
+                regime_line = (
+                    f"Regime: {reg_data.get('direction_label','?')} / "
+                    f"{reg_data.get('vol_regime','?')} / {playbook}"
+                )
+                strike = atm
+                opt_price = get_strike_ltp(oc, strike, "PE")
+                # P0.5: Abort on missing price — never trade blind.
+                if opt_price is None:
+                    logger.error("DATA_FAULT hunt_market_once sym=%s BEARISH_EXPANSION PE ltp=None aborting", sym)
+                    print(f"   🚫 {sym} NAKED PE: DATA_FAULT ltp unavailable — trade aborted.")
+                else:
+                    sl = round(opt_price * 0.80, 2)
+                    t1 = round(opt_price * 1.25, 2)
+                    t2 = round(opt_price * 1.50, 2)
+                    trade_id = f"{today_tag}-NAKED-{len(naked_trades)+1:02d}"
+                    contract = f"{sym} {strike} PE"
+                    new_trade = {
+                        "trade_id": trade_id, "book": "NAKED", "symbol": sym,
+                        "contract": contract, "action": "BUY",
+                        "strategy": "Bearish Put Momentum (Downside Expansion)",
+                        "qty": lot, "entry_time": now_str, "entry_price": opt_price,
+                        "stop_loss": sl, "target_1": t1, "target_2": t2,
+                        "status": "ACTIVE", "exit_time": None, "exit_price": None,
+                        "exit_reason": None, "margin_deployed": round(opt_price * lot, 2)
+                    }
+                    trades.append(new_trade)
+                    _write_ledger(trades, LEDGER_FILE)
+                    cooldowns[sym] = time.time()
+                    save_cooldown_state(cooldowns)
+                    msg = f"""🚨 *STOCKERA QUANT: NAKED DIRECTIONAL BUY ALERT* 🚨
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
 📅 *Expiry:* `{expiry}` | *Book:* 🔴 NAKED DIRECTIONAL
@@ -228,37 +278,55 @@ def hunt_market_once():
 • *Target 2 (Trail SL):* ₹{t2:.2f} (+50% / +₹{(t2 - opt_price) * lot:,.2f}) 🚀
 • *Realized R:R Ratio:* 1 : 2.50 ✅
 ━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 *{regime_line}*
 ⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
-                print(f"\n🚀 DISPATCHING NAKED BEARISH ALERT:\n{msg}\n")
-                send_telegram_alert(msg)
+                    print(f"\n🚀 DISPATCHING NAKED BEARISH ALERT:\n{msg}\n")
+                    send_telegram_alert(msg)
 
         elif regime == "BULLISH_EXPANSION":
-            strike = atm
-            opt_price = get_strike_ltp(oc, strike, "CE")
-            # P0.5: Abort on missing price — never trade blind.
-            if opt_price is None:
-                logger.error("DATA_FAULT hunt_market_once sym=%s BULLISH_EXPANSION CE ltp=None aborting", sym)
-                print(f"   🚫 {sym} NAKED CE: DATA_FAULT ltp unavailable — trade aborted.")
+            # Regime gate: block if the vol-adjusted playbook is not bullish.
+            allowed, reg_data, playbook = _check_regime_gate(c, _BULLISH_PLAYBOOKS)
+            if not allowed:
+                reason = (
+                    f"{reg_data.get('direction_label','?')} / "
+                    f"{reg_data.get('vol_regime','?')} / {playbook}"
+                )
+                logger.info(
+                    "REGIME_GATED: sym=%s book=NAKED reason=%s playbook=%s",
+                    sym, reason, playbook,
+                )
+                print(f"   🚦 {sym} NAKED CE: REGIME_GATED ({reason}) — signal suppressed.")
             else:
-                sl = round(opt_price * 0.80, 2)
-                t1 = round(opt_price * 1.25, 2)
-                t2 = round(opt_price * 1.50, 2)
-                trade_id = f"{today_tag}-NAKED-{len(naked_trades)+1:02d}"
-                contract = f"{sym} {strike} CE"
-                new_trade = {
-                    "trade_id": trade_id, "book": "NAKED", "symbol": sym,
-                    "contract": contract, "action": "BUY",
-                    "strategy": "Bullish Call Momentum (Upside Breakout)",
-                    "qty": lot, "entry_time": now_str, "entry_price": opt_price,
-                    "stop_loss": sl, "target_1": t1, "target_2": t2,
-                    "status": "ACTIVE", "exit_time": None, "exit_price": None,
-                    "exit_reason": None, "margin_deployed": round(opt_price * lot, 2)
-                }
-                trades.append(new_trade)
-                _write_ledger(trades, LEDGER_FILE)
-                cooldowns[sym] = time.time()
-                save_cooldown_state(cooldowns)
-                msg = f"""🚨 *STOCKERA QUANT: NAKED DIRECTIONAL BUY ALERT* 🚨
+                regime_line = (
+                    f"Regime: {reg_data.get('direction_label','?')} / "
+                    f"{reg_data.get('vol_regime','?')} / {playbook}"
+                )
+                strike = atm
+                opt_price = get_strike_ltp(oc, strike, "CE")
+                # P0.5: Abort on missing price — never trade blind.
+                if opt_price is None:
+                    logger.error("DATA_FAULT hunt_market_once sym=%s BULLISH_EXPANSION CE ltp=None aborting", sym)
+                    print(f"   🚫 {sym} NAKED CE: DATA_FAULT ltp unavailable — trade aborted.")
+                else:
+                    sl = round(opt_price * 0.80, 2)
+                    t1 = round(opt_price * 1.25, 2)
+                    t2 = round(opt_price * 1.50, 2)
+                    trade_id = f"{today_tag}-NAKED-{len(naked_trades)+1:02d}"
+                    contract = f"{sym} {strike} CE"
+                    new_trade = {
+                        "trade_id": trade_id, "book": "NAKED", "symbol": sym,
+                        "contract": contract, "action": "BUY",
+                        "strategy": "Bullish Call Momentum (Upside Breakout)",
+                        "qty": lot, "entry_time": now_str, "entry_price": opt_price,
+                        "stop_loss": sl, "target_1": t1, "target_2": t2,
+                        "status": "ACTIVE", "exit_time": None, "exit_price": None,
+                        "exit_reason": None, "margin_deployed": round(opt_price * lot, 2)
+                    }
+                    trades.append(new_trade)
+                    _write_ledger(trades, LEDGER_FILE)
+                    cooldowns[sym] = time.time()
+                    save_cooldown_state(cooldowns)
+                    msg = f"""🚨 *STOCKERA QUANT: NAKED DIRECTIONAL BUY ALERT* 🚨
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
 📅 *Expiry:* `{expiry}` | *Book:* 🔴 NAKED DIRECTIONAL
@@ -279,9 +347,10 @@ def hunt_market_once():
 • *Target 2 (Trail SL):* ₹{t2:.2f} (+50% / +₹{(t2 - opt_price) * lot:,.2f}) 🚀
 • *Realized R:R Ratio:* 1 : 2.50 ✅
 ━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 *{regime_line}*
 ⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
-                print(f"\n🚀 DISPATCHING NAKED BULLISH ALERT:\n{msg}\n")
-                send_telegram_alert(msg)
+                    print(f"\n🚀 DISPATCHING NAKED BULLISH ALERT:\n{msg}\n")
+                    send_telegram_alert(msg)
 
     # --- B. HEDGED RANGE-BOUND BOOK ---
     if hedged_candidate and len(hedged_trades) < 3:
@@ -289,6 +358,32 @@ def hunt_market_once():
         sym, spot, pcr = c["sym"], c["spot"], c["pcr"]
         oc, expiry, lot, step, atm = c["oc"], c["expiry"], c["lot"], c["step"], c["atm"]
         max_pain, call_wall, put_wall = c["max_pain"], c["call_wall"], c["put_wall"]
+
+        # Regime gate: block if the vol-adjusted playbook is not range-bound.
+        allowed, reg_data, playbook = _check_regime_gate(c, _RANGE_PLAYBOOKS)
+        if not allowed:
+            reason = (
+                f"{reg_data.get('direction_label','?')} / "
+                f"{reg_data.get('vol_regime','?')} / {playbook}"
+            )
+            logger.info(
+                "REGIME_GATED: sym=%s book=HEDGED reason=%s playbook=%s",
+                sym, reason, playbook,
+            )
+            print(f"   🚦 {sym} HEDGED CONDOR: REGIME_GATED ({reason}) — signal suppressed.")
+            # Skip the rest of this hedged block
+            hedged_candidate = None
+
+    if hedged_candidate and len(hedged_trades) < 3:
+        c = hedged_candidate
+        sym, spot, pcr = c["sym"], c["spot"], c["pcr"]
+        oc, expiry, lot, step, atm = c["oc"], c["expiry"], c["lot"], c["step"], c["atm"]
+        max_pain, call_wall, put_wall = c["max_pain"], c["call_wall"], c["put_wall"]
+        reg_data_h = _check_regime_gate(c, _RANGE_PLAYBOOKS)[1]
+        regime_line_h = (
+            f"Regime: {reg_data_h.get('direction_label','?')} / "
+            f"{reg_data_h.get('vol_regime','?')} / {reg_data_h.get('playbook','?')}"
+        )
 
         s_ce, b_ce = atm + 2 * step, atm + 4 * step
         s_pe, b_pe = atm - 2 * step, atm - 4 * step
@@ -346,6 +441,8 @@ def hunt_market_once():
 🔹 *Step 2: SELL Short Strikes*
    3. 🔴 `SELL {sym} {s_ce} CE @ ₹{p_sce:.2f} (Short Call)`
    4. 🔴 `SELL {sym} {s_pe} PE @ ₹{p_spe:.2f} (Short Put)`
+━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 *{regime_line_h}*
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 💰 *RISK & REWARD BLUEPRINT ({lot} Qty / 1 Lot):*
 • *Net Credit Collected:* +₹{net_credit:.2f} / lot
