@@ -8,6 +8,7 @@ collisions: chain_snapshotter.py is the SINGLE writer; this module is read-only.
 import logging
 from live_spot_service import get_live_spots
 from chain_snapshotter import get_latest_chain_snapshot, DEFAULT_DB_PATH
+from db_init import init_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ def analyze_option_chain_microstructure(symbol: str, db_path: str = DEFAULT_DB_P
     to alert or trade.
     """
     import datetime
+    init_db(db_path)
     spots = get_live_spots()
     spot = spots.get(symbol) or 0.0
     spot_fetched_at = datetime.datetime.now().isoformat(timespec="seconds")

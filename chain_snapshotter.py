@@ -193,6 +193,7 @@ def get_latest_chain_snapshot(
     the single-writer snapshotter; callers MUST NOT hit Dhan directly.
     """
     try:
+        init_db(db_path)
         now_ist = datetime.datetime.now(tz=ZoneInfo("Asia/Kolkata"))
         today_str = now_ist.strftime("%Y-%m-%d")
 
@@ -289,6 +290,7 @@ def get_latest_chain_snapshot(
 
 def poll_once(symbol: str, db_path: str = DEFAULT_DB_PATH) -> int:
     """Fetch one chain snapshot and persist. Returns rows inserted."""
+    init_db(db_path)
     if not _ACCESS_TOKEN or not _CLIENT_ID:
         raise RuntimeError("Dhan credentials not loaded")
     return _fetch_and_persist(symbol, db_path)
