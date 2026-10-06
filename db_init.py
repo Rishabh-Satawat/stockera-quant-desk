@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS candidates (
     expiry            TEXT NOT NULL,
     playbook_id       TEXT NOT NULL,
     tier              INTEGER NOT NULL,     -- 1, 2, or 0
-    score             REAL NOT NULL,
+    score             REAL NOT NULL,        -- adjusted score (after provisional reduction)
+    raw_score         REAL,                 -- before provisional reduction
     score_breakdown   JSON NOT NULL,
     vol_regime        TEXT NOT NULL,
     vol_provisional   INTEGER NOT NULL,     -- 0 or 1
@@ -114,6 +115,12 @@ CREATE TABLE IF NOT EXISTS candidates (
     or_low            REAL,
     dispatched        INTEGER NOT NULL,     -- 1 if trade was sent to broker, 0 otherwise
     skip_reason       TEXT,
+    -- dedup fields (Phase 1G)
+    setup_key         TEXT,                 -- symbol|playbook_id|expiry|direction_vol_regime
+    first_seen        TEXT,                 -- ISO-8601 UTC timestamp of first observation
+    last_seen         TEXT,                 -- ISO-8601 UTC timestamp of last observation
+    occurrences       INTEGER NOT NULL DEFAULT 1,  -- number of scans matching this setup
+    setup_closed_at   TEXT,                 -- set when a regime shift closes this setup row
     -- outcome fields populated by outcome_labeller.py (after the session)
     outcome_label     TEXT,                 -- WINNER / LOSER / EXPIRED / NULL
     pnl_points        REAL,
@@ -129,12 +136,38 @@ CREATE INDEX IF NOT EXISTS idx_candidates_symbol
     ON candidates (symbol, playbook_id);
 """
 
+# Phase 1G index — created after column migrations so it works on upgraded DBs too.
+_PHASE1G_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_candidates_setup_key
+    ON candidates (setup_key, setup_closed_at);
+"""
+
+# Columns added in Phase 1G — applied via ALTER TABLE for existing databases.
+_PHASE1G_MIGRATIONS = [
+    "ALTER TABLE candidates ADD COLUMN raw_score REAL",
+    "ALTER TABLE candidates ADD COLUMN setup_key TEXT",
+    "ALTER TABLE candidates ADD COLUMN first_seen TEXT",
+    "ALTER TABLE candidates ADD COLUMN last_seen TEXT",
+    "ALTER TABLE candidates ADD COLUMN occurrences INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE candidates ADD COLUMN setup_closed_at TEXT",
+]
+
 
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(_SCHEMA_SQL)
+        conn.commit()
+        # Apply Phase 1G column additions idempotently (ignored if already present).
+        for stmt in _PHASE1G_MIGRATIONS:
+            try:
+                conn.execute(stmt)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists — safe to ignore
+        # Create Phase 1G index after columns exist.
+        conn.executescript(_PHASE1G_INDEX_SQL)
         conn.commit()
     finally:
         conn.close()

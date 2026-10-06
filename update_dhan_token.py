@@ -44,7 +44,7 @@ try:
     if resp.status_code == 200:
         print("\n✅ SUCCESS: New Dhan Token is ACTIVE and verified with DhanHQ API!")
         print(f"• Updated across {updated_count} .env files.")
-        print("• Valid for next 30 days. No further action needed.")
+        print("• Valid for next 24 hours. Renewal is handled automatically at 08:45 IST by market_day_supervisor.py.")
     else:
         print(f"\n⚠️ Token saved, but Dhan verification returned HTTP {resp.status_code}: {resp.text}")
 except Exception as e:
