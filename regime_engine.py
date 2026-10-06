@@ -63,6 +63,16 @@ _PLAYBOOK_MATRIX: dict[tuple[str, str], str] = {
     ("NEUTRAL",     "HIGH_VOL"):      "STRADDLE_BUY",
 }
 
+# PB4 0DTE Gamma Blast is evaluated outside this matrix by evaluate_pb4_gamma_blast
+# (requires DTE==0, time>=13:00 IST, negative GEX, and volume acceleration checks that
+# cannot be expressed as a simple direction×vol lookup).
+# Valid playbook names that scoring_engine and auto_trade_hunter recognise:
+#   "LONG_CALL", "LONG_CALL_SPREAD", "BULL_CALL_SPREAD",
+#   "LONG_PUT",  "LONG_PUT_SPREAD",  "BEAR_PUT_SPREAD",
+#   "SHORT_STRANGLE", "IRON_CONDOR", "STRADDLE_BUY",
+#   "PB4_GAMMA_BLAST"   ← Phase 2 directional 0DTE expiry blast
+_PB4_PLAYBOOK_NAME = "PB4_GAMMA_BLAST"
+
 
 def get_playbook(direction: str, vol_regime: str) -> str:
     return _PLAYBOOK_MATRIX.get((direction, vol_regime), "NO_TRADE")

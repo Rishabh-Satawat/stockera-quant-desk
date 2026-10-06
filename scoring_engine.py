@@ -1,10 +1,10 @@
-"""Composite Confluence Scoring Engine — Phase 1C / Phase 1D.
+"""Composite Confluence Scoring Engine — Phase 1C / Phase 1D / Phase 2.
 
 Scores every evaluated PlaybookSignal 0–100 using 5 weighted pillars:
 
   Pillar 1  Regime & Structure Alignment          30 pts
-  Pillar 2  PCR & Strike Concentration            25 pts
-             (TODO Phase 3: attach aggressor CVD delta-flow here)
+  Pillar 2  PCR & Strike Concentration + GEX      25 pts
+             (GEX zone alignment supplements PCR when available)
   Pillar 3  Volatility & Expected Move            20 pts
   Pillar 4  Risk:Reward Metric                    15 pts
   Pillar 5  Data Quality & Freshness              10 pts
@@ -52,10 +52,13 @@ def _score_regime_structure(signal: PlaybookSignal) -> float:
     pb = signal.playbook_id
 
     pb1_vols = ("NORMAL_VOL", "ELEVATED_VOL", "HIGH_VOL", "LOW_VOL")
+    pb4_vols = ("NORMAL_VOL", "ELEVATED_VOL", "HIGH_VOL", "LOW_VOL")  # same as PB1
     pb2_vols = ("NORMAL_VOL", "LOW_VOL")
     pb6_vols = ("NORMAL_VOL", "LOW_VOL")
 
     if pb == "PB1" and vol in pb1_vols:
+        pts += 15.0
+    elif pb == "PB4" and vol in pb4_vols:
         pts += 15.0
     elif pb == "PB2" and vol in pb2_vols:
         pts += 15.0
@@ -154,6 +157,17 @@ def _score_volatility_em(signal: PlaybookSignal) -> float:
         else:  # LOW_VOL — cheap but delta moves are small
             pts = 16.0
 
+    elif pb == "PB4":
+        # 0DTE Gamma Blast: same profile as PB1 (directional play)
+        if vol == "NORMAL_VOL":
+            pts = 20.0
+        elif vol == "ELEVATED_VOL":
+            pts = 14.0
+        elif vol == "HIGH_VOL":
+            pts = 8.0
+        else:  # LOW_VOL
+            pts = 16.0
+
     elif pb in ("PB2", "PB6"):
         # Sellers want lower vol; premium rich but manageable
         if vol == "NORMAL_VOL":
@@ -183,16 +197,27 @@ def _score_risk_reward(signal: PlaybookSignal) -> float:
     spot = signal.spot
     step = signal.step
 
-    if pb == "PB1":
-        # Naked/debit: ATM option. Assume 1:1.5 R:R as baseline = 15 pts;
-        # weaker conviction gets partial.
-        d = abs(signal.direction_score)
-        if d >= 4:
-            pts = 15.0
-        elif d >= 2:
-            pts = 10.0
+    if pb in ("PB1", "PB4"):
+        # Naked/debit: ATM option. PB4 uses sub_scores["rr"] if available for precise R:R.
+        if pb == "PB4":
+            rr = signal.sub_scores.get("rr", 0.0)
+            if rr >= 2.5:
+                pts = 15.0
+            elif rr >= 2.0:
+                pts = 12.0
+            elif rr >= 1.5:
+                pts = 8.0
+            else:
+                pts = 4.0
         else:
-            pts = 5.0
+            # PB1: Assume 1:1.5 R:R as baseline = 15 pts; weaker conviction gets partial.
+            d = abs(signal.direction_score)
+            if d >= 4:
+                pts = 15.0
+            elif d >= 2:
+                pts = 10.0
+            else:
+                pts = 5.0
 
     elif pb in ("PB2", "PB6"):
         # Credit spread: PoP proxy = distance from spot to short strike / wing width
@@ -233,6 +258,33 @@ def _score_data_quality(signal: PlaybookSignal, data_age_seconds: float = 0.0) -
     return 10.0
 
 
+def _score_gex_zone(signal: PlaybookSignal) -> float:
+    """GEX zone alignment bonus for Pillar 2 — max 8 pts.
+
+    Dealer positioning either dampens or amplifies price movement.  When the
+    GEX zone aligns with the playbook's structural bet, add confidence pts.
+
+      Positive GEX + (PB2 / PB6): dealers dampen vol → mean-reversion / income
+                                    strategies gain dealer-wind-at-back → +8 pts
+      Negative GEX + (PB1 / PB4): dealers amplify moves → directional momentum
+                                    strategies gain dealer-driven acceleration  → +8 pts
+      NEAR_FLIP (either direction):  regime is unstable — breakout zone →       +3 pts
+                                     (could ignite but direction uncertain)
+      Any playbook + misaligned zone: market makers working against the trade → +0 pts
+      UNKNOWN: GEX data unavailable → no adjustment →                           +0 pts
+    """
+    gex_zone = getattr(signal, "gex_zone", "UNKNOWN")
+    pb = signal.playbook_id
+
+    if gex_zone == "POSITIVE" and pb in ("PB2", "PB6"):
+        return 8.0
+    if gex_zone == "NEGATIVE" and pb in ("PB1", "PB4"):
+        return 8.0
+    if gex_zone == "NEAR_FLIP":
+        return 3.0
+    return 0.0
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────────────────────
@@ -252,7 +304,9 @@ def score_candidate(
         }
     """
     p1 = _score_regime_structure(signal)
-    p2 = _score_microstructure(signal)
+    p2_base = _score_microstructure(signal)
+    p2_gex = _score_gex_zone(signal)
+    p2 = min(p2_base + p2_gex, 25.0)  # GEX can boost to cap; never exceeds 25
     p3 = _score_volatility_em(signal)
     p4 = _score_risk_reward(signal)
     p5 = _score_data_quality(signal, data_age_seconds)
@@ -278,6 +332,9 @@ def score_candidate(
         "volatility_em": round(p3, 1),
         "risk_reward": round(p4, 1),
         "data_quality": round(p5, 1),
+        "gex_zone": getattr(signal, "gex_zone", "UNKNOWN"),
+        "gex_bonus": round(p2_gex, 1),
+        "gex_dealer_assumption": "long_call_short_put",
     }
 
     return {
