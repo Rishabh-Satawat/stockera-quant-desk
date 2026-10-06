@@ -10,6 +10,7 @@ from market_hours_gate import is_market_open  # P0.1
 from regime_engine import compute_regime, get_playbook
 from playbook_triggers import evaluate_all_playbooks, PlaybookSignal
 from scoring_engine import score_candidate, rank_and_filter, format_confluence_breakdown, TIER1_THRESHOLD
+from candidate_logger import log_candidate
 from db_init import DEFAULT_DB_PATH
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -175,15 +176,7 @@ def hunt_market_once():
         last_t = cooldowns.get(sym, 0)
         cooldown_rem = max(0, int((900 - (time.time() - last_t)) / 60))
 
-        # Legacy PCR regime label for display
-        if pcr < 0.85:
-            pcr_regime = "BEARISH_EXPANSION"
-        elif pcr > 1.15:
-            pcr_regime = "BULLISH_EXPANSION"
-        else:
-            pcr_regime = "RANGE_BOUND"
-
-        print(f"   • {sym:<10} | Spot: ₹{spot:,.2f} | PCR: {pcr:.2f} ({pcr_regime}) | MaxPain: {max_pain:.0f} | Cooldown: {cooldown_rem}m")
+        print(f"   • {sym:<10} | Spot: ₹{spot:,.2f} | PCR: {pcr:.2f} | MaxPain: {max_pain:.0f} | Cooldown: {cooldown_rem}m")
 
         if cooldown_rem > 0:
             continue
@@ -209,19 +202,6 @@ def hunt_market_once():
             continue
 
         playbook_name = reg_data.get("playbook", "NO_TRADE")
-        # Check the direction of the legacy PCR regime against the new regime
-        # and emit REGIME_GATED log if there's a conflict.
-        pcr_val = analysis["pcr_oi"]
-        if pcr_val < 0.85 and playbook_name not in _BEARISH_PLAYBOOKS:
-            logger.info(
-                "REGIME_GATED: sym=%s book=NAKED reason=%s/%s/%s playbook=%s",
-                sym, reg_data.get("direction_label"), reg_data.get("vol_regime"), "PCR_BEAR_EXPANSION", playbook_name,
-            )
-        elif pcr_val > 1.15 and playbook_name not in _BULLISH_PLAYBOOKS:
-            logger.info(
-                "REGIME_GATED: sym=%s book=NAKED reason=%s/%s/%s playbook=%s",
-                sym, reg_data.get("direction_label"), reg_data.get("vol_regime"), "PCR_BULL_EXPANSION", playbook_name,
-            )
 
         # Evaluate all playbooks
         signals = evaluate_all_playbooks(sym, analysis, reg_data, step)
@@ -235,12 +215,14 @@ def hunt_market_once():
                     "scoring: %s %s score=%d < 60 — dropped",
                     sym, sig.playbook_id, score_result["score"],
                 )
+                log_candidate(sig, score_result, dispatched=False, skip_reason="score<60")
                 continue
             elif tier == 2:
                 logger.info(
                     "scoring: %s %s score=%d tier=2 watchlist",
                     sym, sig.playbook_id, score_result["score"],
                 )
+                log_candidate(sig, score_result, dispatched=False, skip_reason="tier2_watchlist")
             # Both tier 1 and tier 2 are collected; we dispatch only tier 1 below
             all_signals.append((sig, score_result, md))
 
@@ -330,6 +312,7 @@ def hunt_market_once():
                     f"• *Downside Target Wall:* {put_wall:.0f} (Next Major Support)"
                 )
 
+            provisional_tag = "\n⚠️ *PROVISIONAL (Cold-Start IVR)*" if sig.vol_provisional else ""
             msg = f"""🚨 *STOCKERA QUANT: NAKED DIRECTIONAL BUY ALERT* 🚨
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
@@ -350,10 +333,11 @@ def hunt_market_once():
 • *Realized R:R Ratio:* 1 : 2.50 ✅
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 *{reg_line}*
-{conf_block}
+{conf_block}{provisional_tag}
 ⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
             print(f"\n🚀 DISPATCHING NAKED ALERT (score={score_int}/100):\n{msg}\n")
             send_telegram_alert(msg)
+            log_candidate(sig, score_result, dispatched=True)
 
         # ── Hedged spread / condor (PB2, PB6) ──
         elif sig.playbook_id in ("PB2", "PB6") and len(hedged_trades) + dispatched_hedged < 3:
@@ -401,6 +385,7 @@ def hunt_market_once():
             save_cooldown_state(cooldowns)
             dispatched_hedged += 1
 
+            provisional_tag = "\n⚠️ *PROVISIONAL (Cold-Start IVR)*" if sig.vol_provisional else ""
             msg = f"""🚨 *STOCKERA QUANT: HEDGED BASKET ALERT* 🚨
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
@@ -422,7 +407,7 @@ def hunt_market_once():
    4. 🔴 `SELL {sym} {s_pe:.0f} PE @ ₹{p_spe:.2f} (Short Put)`
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 *{reg_line}*
-{conf_block}
+{conf_block}{provisional_tag}
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 💰 *RISK & REWARD BLUEPRINT ({lot} Qty / 1 Lot):*
 • *Net Credit Collected:* +₹{net_credit:.2f} / lot
@@ -434,6 +419,7 @@ def hunt_market_once():
 ⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
             print(f"\n🚀 DISPATCHING HEDGED BASKET ALERT (score={score_int}/100):\n{msg}\n")
             send_telegram_alert(msg)
+            log_candidate(sig, score_result, dispatched=True)
 
 
 def start_continuous_hunter():

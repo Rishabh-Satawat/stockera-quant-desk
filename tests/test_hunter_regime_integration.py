@@ -236,8 +236,13 @@ class TestHunterRegimeGate:
         )
         assert trades[0]["book"] == "HEDGED"
 
-    def test_regime_gate_logs_gated_reason(self, tmp_path, caplog):
-        """Gated signals are logged with REGIME_GATED: prefix."""
+    def test_regime_gate_no_legacy_pcr_logs(self, tmp_path, caplog):
+        """Phase 1D: Legacy PCR REGIME_GATED branches removed.
+
+        The hunter must not emit REGIME_GATED logs based on raw PCR thresholds
+        (pcr < 0.85 / pcr > 1.15) — those branches were removed in Phase 1D.
+        Regime gating now flows through evaluate_all_playbooks + score_candidate only.
+        """
         import logging
 
         analysis = _base_analysis("NIFTY", 22000.0, regime_pcr=0.70)
@@ -252,9 +257,14 @@ class TestHunterRegimeGate:
         with caplog.at_level(logging.INFO, logger="auto_trade_hunter"):
             self._run_hunt(tmp_path, {"NIFTY": analysis}, regime)
 
-        gated_logs = [r for r in caplog.records if "REGIME_GATED" in r.message]
-        assert len(gated_logs) >= 1, "Expected at least one REGIME_GATED log entry"
-        assert "BULL" in gated_logs[0].message or "BULL_CALL_SPREAD" in gated_logs[0].message
+        # Legacy PCR-based REGIME_GATED messages must no longer appear
+        legacy_pcr_logs = [
+            r for r in caplog.records
+            if "REGIME_GATED" in r.message and "PCR_" in r.message
+        ]
+        assert len(legacy_pcr_logs) == 0, (
+            "Legacy PCR REGIME_GATED branches should have been removed in Phase 1D"
+        )
 
 
 class TestColdStartVolProvisional:
