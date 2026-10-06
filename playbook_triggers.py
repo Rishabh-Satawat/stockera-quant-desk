@@ -1,8 +1,9 @@
-"""Playbook Trigger Evaluators — Phase 1C.
+"""Playbook Trigger Evaluators — Phase 1C / Phase 2.
 
-Implements institutional trigger logic for the three core production playbooks:
+Implements institutional trigger logic for the four core production playbooks:
   PB1  Directional Trend Continuation
   PB2  Mean Reversion / Max Pain Pinning
+  PB4  0DTE Expiry Gamma Blast  (Phase 2)
   PB6  Steady-State 0DTE Theta Condor
 
 Each evaluator returns a PlaybookSignal (or None) carrying the playbook id,
@@ -15,19 +16,30 @@ analysis dict — no live network calls are made here.
 
 from __future__ import annotations
 
+import datetime
 import logging
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+_IST = ZoneInfo("Asia/Kolkata")
+
+# PB4: 0DTE Gamma Blast only fires after 13:00 IST on expiry day
+_PB4_ENTRY_HOUR_IST = 13
+# PB4: spot must be within this fraction of gamma_flip_level to count as "crossing"
+_PB4_FLIP_PROXIMITY_PCT = 0.005   # 0.5% of spot
+# PB4: minimum R:R ratio required
+_PB4_MIN_RR = 2.5
 
 
 @dataclass
 class PlaybookSignal:
     """Output of a successful playbook trigger evaluation."""
 
-    playbook_id: str        # "PB1", "PB2", "PB6"
+    playbook_id: str        # "PB1", "PB2", "PB4", "PB6"
     symbol: str
     direction: str          # "BULL", "BEAR", "NEUTRAL"
     vol_regime: str
@@ -56,6 +68,11 @@ class PlaybookSignal:
     expiry: str = ""
     step: int = 50
     dte: int = 0  # days to expiry at signal time
+
+    # GEX zone fields (Phase 2 — populated by hunter before scoring)
+    gex_zone: str = "UNKNOWN"                   # "POSITIVE", "NEGATIVE", "NEAR_FLIP", "UNKNOWN"
+    gamma_flip_level: Optional[float] = None
+    volume_accelerating: bool = False           # latest bar volume > prior bar volume
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -386,6 +403,174 @@ def evaluate_pb6(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# PB4: 0DTE Expiry Gamma Blast
+# ──────────────────────────────────────────────────────────────────────────────
+
+def evaluate_pb4_gamma_blast(
+    symbol: str,
+    analysis: dict,
+    regime: dict,
+    step: int,
+    gex_data: dict,
+    volume_accelerating: bool = False,
+    current_time_ist: Optional[datetime.time] = None,
+    _reference_date: Optional[date] = None,
+) -> Optional[PlaybookSignal]:
+    """PB4: 0DTE Expiry Gamma Blast — highest-expectancy expiry-day setup.
+
+    Requires ALL of:
+      * DTE == 0 (expiry day only).
+      * Current IST time >= 13:00 (afternoon window; gamma / time decay at peak).
+      * Negative GEX zone: total_net_gex < 0 (market makers amplify moves via
+        delta hedging, creating self-reinforcing directional momentum).
+      * Spot is crossing through / proximal to the gamma_flip_level (or a major
+        strike wall if flip is unavailable) with volume acceleration.
+      * Risk:Reward >= 1:2.5 (tight stop at flip, target at next strike wall).
+
+    Contract selection:
+      * ATM or 1-OTM option in the direction confirmed by regime direction_score.
+      * BULL: ATM Call; BEAR: ATM Put.
+
+    Returns None if any gate fails (fail-closed).
+    """
+    # Gate 1: expiry day only
+    expiry = analysis.get("expiry", "")
+    dte = _compute_dte(expiry, _reference_date)
+    if dte != 0:
+        logger.debug("PB4 %s: DTE=%d != 0 — not expiry day", symbol, dte)
+        return None
+
+    # Gate 2: time window (>= 13:00 IST)
+    if current_time_ist is None:
+        current_time_ist = datetime.datetime.now(tz=_IST).time()
+    cutoff = datetime.time(_PB4_ENTRY_HOUR_IST, 0)
+    if current_time_ist < cutoff:
+        logger.debug("PB4 %s: time %s < 13:00 IST — too early", symbol, current_time_ist)
+        return None
+
+    # Gate 3: negative GEX zone
+    total_net_gex = gex_data.get("total_net_gex", 0.0) or 0.0
+    if total_net_gex >= 0:
+        logger.debug("PB4 %s: total_net_gex=%.2f >= 0 — not negative GEX zone", symbol, total_net_gex)
+        return None
+
+    # Gate 4: spot proximal to gamma_flip_level or a major strike wall
+    spot = float(analysis.get("spot", 0))
+    gamma_flip = gex_data.get("gamma_flip_level")
+    call_wall = float(analysis.get("call_wall", spot + 500))
+    put_wall = float(analysis.get("put_wall", spot - 500))
+
+    proximity_threshold = spot * _PB4_FLIP_PROXIMITY_PCT
+    near_flip = (
+        gamma_flip is not None
+        and abs(spot - gamma_flip) <= proximity_threshold
+    )
+    near_wall = (
+        abs(spot - call_wall) <= proximity_threshold
+        or abs(spot - put_wall) <= proximity_threshold
+    )
+
+    if not near_flip and not near_wall:
+        logger.debug(
+            "PB4 %s: spot=%.1f not near flip=%.1f or walls (%.1f/%.1f)",
+            symbol, spot, gamma_flip or 0, call_wall, put_wall,
+        )
+        return None
+
+    # Gate 5: volume acceleration required
+    if not volume_accelerating:
+        logger.debug("PB4 %s: volume_accelerating=False — gate failed", symbol)
+        return None
+
+    # Direction from regime direction_score
+    direction_score_val = int(regime.get("direction_score", 0))
+    if direction_score_val > 0:
+        eff_dir = "BULL"
+    elif direction_score_val < 0:
+        eff_dir = "BEAR"
+    else:
+        # Neutral regime on expiry day: use spot vs flip to determine direction
+        if gamma_flip is not None:
+            eff_dir = "BULL" if spot >= gamma_flip else "BEAR"
+        else:
+            logger.debug("PB4 %s: NEUTRAL regime + no flip — cannot determine direction", symbol)
+            return None
+
+    # Gate 6: R:R >= 1:2.5 (stop at flip, target at next strike wall)
+    if gamma_flip is not None:
+        stop_dist = abs(spot - gamma_flip)
+    else:
+        # Fall back to 0.5% of spot as proxy stop distance
+        stop_dist = spot * 0.005
+
+    target_dist = (call_wall - spot) if eff_dir == "BULL" else (spot - put_wall)
+
+    if stop_dist <= 0:
+        logger.debug("PB4 %s: zero stop distance — skipping", symbol)
+        return None
+
+    rr = target_dist / stop_dist
+    if rr < _PB4_MIN_RR:
+        logger.debug("PB4 %s: R:R=%.2f < %.1f — gate failed", symbol, rr, _PB4_MIN_RR)
+        return None
+
+    # Contract selection: ATM option in direction
+    atm_strike = _atm(spot, step)
+    instrument_type = "ATM_CALL" if eff_dir == "BULL" else "ATM_PUT"
+
+    vol_regime = regime.get("vol_regime", "NORMAL_VOL")
+    vol_provisional = bool(regime.get("vol_provisional", False))
+    pcr = float(analysis.get("pcr_oi", 1.0))
+    max_pain = float(analysis.get("max_pain", spot))
+
+    # Determine GEX zone label
+    if gamma_flip is not None and near_flip:
+        gex_zone_label = "NEAR_FLIP"
+    else:
+        gex_zone_label = "NEGATIVE"
+
+    reason = (
+        f"PB4 0DTE_GAMMA_BLAST {eff_dir} | spot={spot:.0f} | flip={f'{gamma_flip:.0f}' if gamma_flip else 'N/A'} "
+        f"| GEX={total_net_gex:.0f} | R:R={rr:.1f} | vol_acc={volume_accelerating}"
+    )
+
+    sub_scores = {
+        "dte": dte,
+        "total_net_gex": round(total_net_gex, 2),
+        "rr": round(rr, 2),
+        "near_flip": near_flip,
+        "near_wall": near_wall,
+        "volume_accelerating": volume_accelerating,
+    }
+
+    return PlaybookSignal(
+        playbook_id="PB4",
+        symbol=symbol,
+        direction=eff_dir,
+        vol_regime=vol_regime,
+        vol_provisional=vol_provisional,
+        instrument_type=instrument_type,
+        atm_strike=atm_strike,
+        short_strike_ce=atm_strike if eff_dir == "BULL" else None,
+        short_strike_pe=atm_strike if eff_dir == "BEAR" else None,
+        reason=reason,
+        sub_scores=sub_scores,
+        spot=spot,
+        max_pain=max_pain,
+        call_wall=call_wall,
+        put_wall=put_wall,
+        pcr=pcr,
+        direction_score=direction_score_val,
+        expiry=expiry,
+        step=step,
+        dte=dte,
+        gex_zone=gex_zone_label,
+        gamma_flip_level=gamma_flip,
+        volume_accelerating=volume_accelerating,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Composite evaluator
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -398,24 +583,72 @@ def evaluate_all_playbooks(
     or_low: Optional[float] = None,
     vwap: Optional[float] = None,
     _reference_date: Optional[date] = None,
+    gex_data: Optional[dict] = None,
+    volume_accelerating: bool = False,
+    current_time_ist: Optional[datetime.time] = None,
 ) -> list[PlaybookSignal]:
-    """Evaluate all three playbooks for the given symbol and return all that trigger.
+    """Evaluate all playbooks for the given symbol and return all that trigger.
+
+    Phase 2 additions:
+      gex_data: result of gex_engine.compute_gex — used to populate gex_zone on
+                all signals and to gate PB4.
+      volume_accelerating: True when latest 15m bar volume > prior bar.
+      current_time_ist: inject IST time for PB4 time-window gate (default: now).
 
     Returns a list (possibly empty) of PlaybookSignal objects.  The caller
     (scoring_engine / auto_trade_hunter) is responsible for ranking and filtering.
     """
     signals: list[PlaybookSignal] = []
 
+    # Compute GEX zone label once and attach to all signals
+    spot = float(analysis.get("spot", 0))
+    gex_zone_label = "UNKNOWN"
+    gamma_flip = None
+    if gex_data:
+        gamma_flip = gex_data.get("gamma_flip_level")
+        total_net_gex = gex_data.get("total_net_gex", 0.0) or 0.0
+        if gamma_flip is not None and spot > 0:
+            flip_pct_dist = abs(spot - gamma_flip) / spot
+            if flip_pct_dist <= 0.0025:   # within 0.25% of flip
+                gex_zone_label = "NEAR_FLIP"
+            elif spot > gamma_flip:
+                gex_zone_label = "POSITIVE"
+            else:
+                gex_zone_label = "NEGATIVE"
+        elif total_net_gex > 0:
+            gex_zone_label = "POSITIVE"
+        elif total_net_gex < 0:
+            gex_zone_label = "NEGATIVE"
+
+    def _attach_gex(sig: PlaybookSignal) -> PlaybookSignal:
+        if sig is not None:
+            sig.gex_zone = gex_zone_label
+            sig.gamma_flip_level = gamma_flip
+            sig.volume_accelerating = volume_accelerating
+        return sig
+
     pb1 = evaluate_pb1(symbol, analysis, regime, step, or_high=or_high, or_low=or_low, vwap=vwap)
     if pb1 is not None:
-        signals.append(pb1)
+        signals.append(_attach_gex(pb1))
 
     pb2 = evaluate_pb2(symbol, analysis, regime, step)
     if pb2 is not None:
-        signals.append(pb2)
+        signals.append(_attach_gex(pb2))
+
+    pb4 = None
+    if gex_data:
+        pb4 = evaluate_pb4_gamma_blast(
+            symbol, analysis, regime, step,
+            gex_data=gex_data,
+            volume_accelerating=volume_accelerating,
+            current_time_ist=current_time_ist,
+            _reference_date=_reference_date,
+        )
+    if pb4 is not None:
+        signals.append(pb4)  # already has gex_zone set
 
     pb6 = evaluate_pb6(symbol, analysis, regime, step, _reference_date=_reference_date)
     if pb6 is not None:
-        signals.append(pb6)
+        signals.append(_attach_gex(pb6))
 
     return signals

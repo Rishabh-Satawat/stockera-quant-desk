@@ -11,7 +11,7 @@ from regime_engine import compute_regime, get_playbook
 from playbook_triggers import evaluate_all_playbooks, PlaybookSignal
 from scoring_engine import score_candidate, rank_and_filter, format_confluence_breakdown, TIER1_THRESHOLD
 from candidate_logger import log_candidate
-from db_init import DEFAULT_DB_PATH
+from db_init import DEFAULT_DB_PATH, get_connection
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -35,6 +35,169 @@ def _require_telegram_token():
 # Never hardcode lot sizes in trading logic; use LOT_SIZES.get(sym) and abort
 # if the symbol is missing.
 LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20, "FINNIFTY": 60}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 2: Institutional Avoidance Rules ("When NOT to Trade")
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _is_chasing_move(spot: float, vwap: float, atr_15m: float) -> bool:
+    """No-Chase Rule: True when spot has extended > 1.2×ATR(15m) from VWAP.
+
+    When True, naked directional buys (PB1) should be blocked — the optimal
+    entry was earlier and a trade here would be chasing an already-extended move.
+    Fails open (returns False) when VWAP or ATR data is unavailable.
+    """
+    if vwap <= 0 or atr_15m <= 0:
+        return False  # fail-open: data unavailable
+    distance = abs(spot - vwap)
+    return distance > 1.2 * atr_15m
+
+
+def _is_low_quality_chop(
+    range_15m: float,
+    expected_daily_range: float,
+    volume_declining: bool,
+    bollinger_squeeze: bool,
+) -> tuple:
+    """Chop & Squeeze Filter — returns (block_naked_buying: bool, block_iron_condor: bool).
+
+    block_naked_buying: True when range is < 0.3× expected daily AND volume declining.
+      Prevents naked option buying (PB1/PB4 ATM options) in dead chop where theta burn
+      consumes premium without directional movement.
+
+    block_iron_condor: True when Bollinger/ATR indicates an extreme vol squeeze.
+      Selling premium (PB6 Iron Condor) right before an explosive expansion is the
+      most dangerous environment for a short-vol strategy.
+
+    Returns (False, False) when data is unavailable (fail-open).
+    """
+    block_naked = False
+    block_condor = False
+
+    if expected_daily_range > 0 and range_15m > 0:
+        if range_15m < 0.3 * expected_daily_range and volume_declining:
+            block_naked = True
+
+    if bollinger_squeeze:
+        block_condor = True
+
+    return block_naked, block_condor
+
+
+def _is_circuit_breaker_active(trades: list, today_tag: str) -> bool:
+    """Daily Loss Circuit Breaker: True after 2 consecutive stop-losses today.
+
+    Queries the in-memory trades list (already loaded from trades_ledger.json) for
+    the current day's closed trades.  If the 2 most-recently-closed trades both hit
+    their stop-loss, halt all new trade generation for the session to prevent
+    revenge-trading / choppy-whipsaw drawdown spirals.
+
+    A 'stop-loss hit' trade must have:
+      - status in {"CLOSED", "STOPPED"}
+      - exit_reason containing "SL" or "STOP" (case-insensitive)
+      - source != "SIMULATED"
+    """
+    today_closed = [
+        t for t in trades
+        if t.get("trade_id", "").startswith(today_tag)
+        and t.get("status", "") in ("CLOSED", "STOPPED")
+        and t.get("source", "LIVE") != "SIMULATED"
+    ]
+    if len(today_closed) < 2:
+        return False
+
+    # Sort by exit_time descending to get the 2 most recent closes
+    sorted_closed = sorted(
+        today_closed,
+        key=lambda t: t.get("exit_time") or "",
+        reverse=True,
+    )
+    last_two = sorted_closed[:2]
+    sl_hits = sum(
+        1 for t in last_two
+        if "SL" in str(t.get("exit_reason", "")).upper()
+        or "STOP" in str(t.get("exit_reason", "")).upper()
+    )
+    return sl_hits >= 2
+
+
+def _compute_atr_and_vwap_15m(
+    symbol: str,
+    db_path: str = DEFAULT_DB_PATH,
+    n_bars: int = 14,
+) -> tuple:
+    """Compute ATR(14) and session VWAP from 15m underlying_bars.
+
+    Returns (atr: float, vwap: float).  Returns (0.0, 0.0) on data unavailability.
+    """
+    try:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        today = _dt.datetime.now(tz=_ZI("Asia/Kolkata")).strftime("%Y-%m-%d")
+        conn = get_connection(db_path)
+        try:
+            cur = conn.execute(
+                """SELECT high, low, close, volume
+                   FROM underlying_bars
+                   WHERE symbol=? AND bar_tf='15m' AND date(bar_open_ts)=?
+                   ORDER BY bar_open_ts""",
+                (symbol, today),
+            )
+            bars = cur.fetchall()
+        finally:
+            conn.close()
+
+        if len(bars) < 2:
+            return 0.0, 0.0
+
+        # ATR(n_bars): true range averages
+        true_ranges = []
+        for i, (high, low, close, vol) in enumerate(bars):
+            if i == 0:
+                tr = high - low
+            else:
+                prev_close = bars[i - 1][2]
+                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            true_ranges.append(tr)
+        atr = sum(true_ranges[-n_bars:]) / min(len(true_ranges), n_bars)
+
+        # Session VWAP = Σ(typical_price × volume) / Σ(volume)
+        total_vol = sum(b[3] for b in bars)
+        if total_vol <= 0:
+            return atr, 0.0
+        vwap = sum(((b[0] + b[1] + b[2]) / 3.0) * b[3] for b in bars) / total_vol
+
+        return atr, vwap
+
+    except Exception as exc:
+        logger.debug("_compute_atr_and_vwap_15m %s: %s", symbol, exc)
+        return 0.0, 0.0
+
+
+def _check_volume_accelerating(symbol: str, db_path: str = DEFAULT_DB_PATH) -> bool:
+    """True when the latest 15m bar volume > the prior 15m bar volume."""
+    try:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        today = _dt.datetime.now(tz=_ZI("Asia/Kolkata")).strftime("%Y-%m-%d")
+        conn = get_connection(db_path)
+        try:
+            cur = conn.execute(
+                """SELECT volume FROM underlying_bars
+                   WHERE symbol=? AND bar_tf='15m' AND date(bar_open_ts)=?
+                   ORDER BY bar_open_ts DESC LIMIT 2""",
+                (symbol, today),
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        if len(rows) < 2:
+            return False
+        return rows[0][0] > rows[1][0]
+    except Exception as exc:
+        logger.debug("_check_volume_accelerating %s: %s", symbol, exc)
+        return False
 
 
 def send_telegram_alert(msg: str):
@@ -189,6 +352,12 @@ def hunt_market_once():
             "sym": sym, "analysis": analysis, "lot": lot, "step": step,
         })
 
+    # Phase 2: Circuit breaker check — halt all signals if 2 consecutive SL hits today
+    if _is_circuit_breaker_active(trades, today_tag):
+        logger.warning("AVOIDANCE_GATE: DAILY_LOSS_CIRCUIT_BREAKER_ACTIVE — halting scan")
+        print("   🔴 CIRCUIT BREAKER ACTIVE: 2 consecutive stop-losses today. No new trades.")
+        return
+
     # For each symbol, compute regime + evaluate playbooks + score
     all_signals: list[tuple[PlaybookSignal, dict, dict]] = []  # (signal, score_result, meta)
 
@@ -207,10 +376,74 @@ def hunt_market_once():
 
         playbook_name = reg_data.get("playbook", "NO_TRADE")
 
-        # Evaluate all playbooks
-        signals = evaluate_all_playbooks(sym, analysis, reg_data, step)
+        # Phase 2: Compute ATR/VWAP and GEX data for avoidance rules and PB4
+        spot = analysis["spot"]
+        atr_15m, vwap_15m = _compute_atr_and_vwap_15m(sym)
+        vol_acc = _check_volume_accelerating(sym)
+
+        # Import gex_engine here (lazy import to avoid circular at module level)
+        try:
+            from gex_engine import compute_gex
+            gex_data = compute_gex(sym, analysis["expiry"], spot, lot)
+        except Exception as exc:
+            logger.debug("gex compute failed for %s: %s — skipping GEX enrichment", sym, exc)
+            gex_data = {}
+
+        # Evaluate all playbooks (passes GEX data for PB4 and zone labelling)
+        signals = evaluate_all_playbooks(
+            sym, analysis, reg_data, step,
+            gex_data=gex_data,
+            volume_accelerating=vol_acc,
+        )
 
         for sig in signals:
+            # Phase 2: Avoidance gates per signal
+            if sig.playbook_id == "PB1":
+                if _is_chasing_move(spot, vwap_15m, atr_15m):
+                    logger.info(
+                        "AVOIDANCE_GATE: CHASE_PREVENTED (Spot extended > 1.2x ATR) sym=%s spot=%.1f vwap=%.1f atr=%.1f",
+                        sym, spot, vwap_15m, atr_15m,
+                    )
+                    print(f"   🚫 {sym} PB1: AVOIDANCE_GATE: CHASE_PREVENTED (Spot extended > 1.2x ATR)")
+                    log_candidate(sig, {"score": 0, "raw_score": 0, "tier": 0, "breakdown": {}},
+                                  dispatched=False, skip_reason="avoidance_chase")
+                    continue
+
+            if sig.playbook_id in ("PB1", "PB4"):
+                call_wall_val = float(analysis.get("call_wall", spot + 500))
+                put_wall_val = float(analysis.get("put_wall", spot - 500))
+                range_15m_val = call_wall_val - put_wall_val   # proxy for expected intraday range
+                block_naked, block_condor = _is_low_quality_chop(
+                    range_15m=atr_15m * 2 if atr_15m > 0 else 0,
+                    expected_daily_range=range_15m_val,
+                    volume_declining=not vol_acc,
+                    bollinger_squeeze=atr_15m > 0 and atr_15m < (spot * 0.001),
+                )
+                if block_naked:
+                    logger.info(
+                        "AVOIDANCE_GATE: CHOP_FILTER naked buying blocked sym=%s", sym,
+                    )
+                    print(f"   🚫 {sym} {sig.playbook_id}: AVOIDANCE_GATE: LOW_QUALITY_CHOP")
+                    log_candidate(sig, {"score": 0, "raw_score": 0, "tier": 0, "breakdown": {}},
+                                  dispatched=False, skip_reason="avoidance_chop")
+                    continue
+
+            if sig.playbook_id == "PB6":
+                _, block_condor = _is_low_quality_chop(
+                    range_15m=0,  # only bollinger_squeeze matters for condor
+                    expected_daily_range=1,
+                    volume_declining=False,
+                    bollinger_squeeze=atr_15m > 0 and atr_15m < (spot * 0.001),
+                )
+                if block_condor:
+                    logger.info(
+                        "AVOIDANCE_GATE: VOL_SQUEEZE condor blocked sym=%s — potential expansion", sym,
+                    )
+                    print(f"   🚫 {sym} PB6: AVOIDANCE_GATE: BOLLINGER_SQUEEZE — condor blocked")
+                    log_candidate(sig, {"score": 0, "raw_score": 0, "tier": 0, "breakdown": {}},
+                                  dispatched=False, skip_reason="avoidance_squeeze")
+                    continue
+
             score_result = score_candidate(sig)
             tier = score_result["tier"]
 
