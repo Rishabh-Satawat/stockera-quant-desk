@@ -121,10 +121,10 @@ def _regime_telemetry(db_path: str) -> list[str]:
 
         spots = get_live_spots()
         for sym in _SYMBOLS:
-            spot = spots.get(sym, 0.0)
+            spot = spots.get(sym) or 0.0
             snap = get_latest_chain_snapshot(sym, db_path)
             expiry = snap.get("expiry", "UNKNOWN") if snap else "UNKNOWN"
-            if spot <= 0 or not snap:
+            if not spot or spot <= 0 or not snap:
                 lines.append(f"  {sym:10s}  [no live data]")
                 continue
             try:

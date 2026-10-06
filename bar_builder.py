@@ -337,6 +337,51 @@ def _upsert_underlying_bar(
     )
 
 
+def build_bars(
+    db_path: str = DEFAULT_DB_PATH,
+    symbols: Optional[list] = None,
+) -> dict:
+    """Aggregate all recent chain_snapshots into 1m/5m/15m OHLCV bars.
+
+    Builds both underlying_bars (from option_type='SPOT' rows written by the
+    snapshotter) and option_bars (from CE/PE rows) for every distinct
+    (symbol, expiry, strike, option_type) combination present in the DB.
+
+    Returns a summary dict: {symbol: {"underlying": n, "option": n}}.
+    This is the entry point called by chain_snapshotter after each full cycle.
+    """
+    if symbols is None:
+        symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
+
+    summary: dict = {}
+    for sym in symbols:
+        u_total = 0
+        for tf in ("1m", "5m", "15m"):
+            u_total += build_underlying_bars(sym, tf, db_path)
+
+        # Discover all distinct (expiry, strike, option_type) combos with
+        # recent snapshots so we can build option bars for each.
+        conn = get_connection(db_path)
+        try:
+            combos = conn.execute(
+                """SELECT DISTINCT expiry, strike, option_type
+                   FROM chain_snapshots
+                   WHERE symbol=? AND option_type != 'SPOT'""",
+                (sym,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        o_total = 0
+        for expiry, strike, opt_type in combos:
+            for tf in ("1m", "5m", "15m"):
+                o_total += build_option_bars(sym, expiry, strike, opt_type, tf, db_path)
+
+        summary[sym] = {"underlying": u_total, "option": o_total}
+
+    return summary
+
+
 def get_option_bars(
     symbol: str,
     expiry: str,
