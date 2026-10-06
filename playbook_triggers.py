@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class PlaybookSignal:
     direction_score: int = 0
     expiry: str = ""
     step: int = 50
+    dte: int = 0  # days to expiry at signal time
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -284,15 +286,30 @@ def evaluate_pb2(
 # PB6: Steady-State 0DTE Theta Condor
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _compute_dte(expiry: str, reference_date: Optional[date] = None) -> int:
+    """Return days-to-expiry from reference_date (default: today) for an ISO-date expiry string."""
+    try:
+        exp = date.fromisoformat(expiry)
+        ref = reference_date or date.today()
+        return max(0, (exp - ref).days)
+    except (ValueError, TypeError):
+        return 999  # unparseable → treat as far-dated (no gate trigger)
+
+
+_PB6_MAX_DTE = 7  # PB6 is short-dated only — 21-day monthly expiries are forbidden
+
+
 def evaluate_pb6(
     symbol: str,
     analysis: dict,
     regime: dict,
     step: int,
+    _reference_date: Optional[date] = None,
 ) -> Optional[PlaybookSignal]:
-    """PB6: Steady-State 0DTE Theta Condor.
+    """PB6: Steady-State Theta Condor (short-dated expiries ≤7 DTE only).
 
     Requires:
+      * Expiry is ≤7 DTE (never traded against a 21-day monthly expiry).
       * Vol regime is NORMAL_VOL or LOW_VOL (not ELEVATED or HIGH — sellers' market
         but not when vol is stretched and condor wings blow out).
       * Spot is between the Call Wall and Put Wall (in the safe corridor).
@@ -312,6 +329,12 @@ def evaluate_pb6(
     max_pain = float(analysis.get("max_pain", spot))
     pcr = float(analysis.get("pcr_oi", 1.0))
     expiry = analysis.get("expiry", "")
+
+    # DTE gate: PB6 is restricted to short-dated expiries only.
+    dte = _compute_dte(expiry, _reference_date)
+    if dte > _PB6_MAX_DTE:
+        logger.debug("PB6 %s: DTE=%d > %d — monthly expiry gate blocked", symbol, dte, _PB6_MAX_DTE)
+        return None
 
     in_corridor = put_wall < spot < call_wall
     sub_scores = {
@@ -334,7 +357,7 @@ def evaluate_pb6(
 
     reason = (
         f"PB6 CONDOR | vol={vol_regime} | spot={spot:.0f} in corridor "
-        f"[{put_wall:.0f}–{call_wall:.0f}]"
+        f"[{put_wall:.0f}–{call_wall:.0f}] | DTE={dte}"
     )
 
     return PlaybookSignal(
@@ -358,6 +381,7 @@ def evaluate_pb6(
         direction_score=regime.get("direction_score", 0),
         expiry=expiry,
         step=step,
+        dte=dte,
     )
 
 
@@ -373,6 +397,7 @@ def evaluate_all_playbooks(
     or_high: Optional[float] = None,
     or_low: Optional[float] = None,
     vwap: Optional[float] = None,
+    _reference_date: Optional[date] = None,
 ) -> list[PlaybookSignal]:
     """Evaluate all three playbooks for the given symbol and return all that trigger.
 
@@ -389,7 +414,7 @@ def evaluate_all_playbooks(
     if pb2 is not None:
         signals.append(pb2)
 
-    pb6 = evaluate_pb6(symbol, analysis, regime, step)
+    pb6 = evaluate_pb6(symbol, analysis, regime, step, _reference_date=_reference_date)
     if pb6 is not None:
         signals.append(pb6)
 

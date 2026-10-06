@@ -200,10 +200,16 @@ class TestCandidateLogger:
         assert row[0] == ts
 
     def test_unique_ids_per_call(self, tmp_db):
+        # Phase 1G: same setup deduplicates — 5 calls → 1 row with occurrences=5
         sig = _make_signal()
         score = _make_score()
         ids = {log_candidate(sig, score, dispatched=True, db_path=tmp_db) for _ in range(5)}
-        assert len(ids) == 5
+        assert len(ids) == 1  # all 5 map to the same open setup row
+        cid = next(iter(ids))
+        conn = sqlite3.connect(tmp_db)
+        row = conn.execute("SELECT occurrences FROM candidates WHERE candidate_id=?", (cid,)).fetchone()
+        conn.close()
+        assert row[0] == 5
 
     def test_sub_scores_gamma_flip_stored(self, tmp_db):
         sig = _make_signal()
@@ -228,19 +234,23 @@ class TestLoadCandidates:
         assert df.empty
 
     def test_load_returns_rows(self, tmp_db):
-        sig = _make_signal()
+        # Two distinct symbols → two distinct setup rows
+        sig1 = _make_signal(symbol="NIFTY")
+        sig2 = _make_signal(symbol="BANKNIFTY")
         score = _make_score()
-        log_candidate(sig, score, dispatched=True, ts_override="2026-10-05T10:00:00+00:00", db_path=tmp_db)
-        log_candidate(sig, score, dispatched=False, ts_override="2026-10-05T11:00:00+00:00", db_path=tmp_db)
+        log_candidate(sig1, score, dispatched=True, ts_override="2026-10-05T10:00:00+00:00", db_path=tmp_db)
+        log_candidate(sig2, score, dispatched=False, ts_override="2026-10-05T11:00:00+00:00", db_path=tmp_db)
 
         df = load_candidates(tmp_db)
         assert len(df) == 2
 
     def test_date_filter_start(self, tmp_db):
-        sig = _make_signal()
+        # Two distinct symbols so each is a separate setup row with its own ts_signal
+        sig1 = _make_signal(symbol="NIFTY")
+        sig2 = _make_signal(symbol="BANKNIFTY")
         score = _make_score()
-        log_candidate(sig, score, dispatched=True, ts_override="2026-10-04T10:00:00+00:00", db_path=tmp_db)
-        log_candidate(sig, score, dispatched=True, ts_override="2026-10-05T10:00:00+00:00", db_path=tmp_db)
+        log_candidate(sig1, score, dispatched=True, ts_override="2026-10-04T10:00:00+00:00", db_path=tmp_db)
+        log_candidate(sig2, score, dispatched=True, ts_override="2026-10-05T10:00:00+00:00", db_path=tmp_db)
 
         df = load_candidates(tmp_db, start_date="2026-10-05")
         assert len(df) == 1

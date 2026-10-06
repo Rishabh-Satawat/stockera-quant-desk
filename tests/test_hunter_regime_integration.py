@@ -28,7 +28,15 @@ def _make_db(tmp_path) -> str:
     return db_path
 
 
-def _base_analysis(sym, spot, regime_pcr, expiry="2026-10-30"):
+def _near_expiry() -> str:
+    """Return an expiry 3 calendar days from today — within PB6's ≤7 DTE gate."""
+    d = datetime.datetime.now(tz=_IST).date() + datetime.timedelta(days=3)
+    return d.isoformat()
+
+
+def _base_analysis(sym, spot, regime_pcr, expiry=None):
+    if expiry is None:
+        expiry = _near_expiry()
     """Minimal analysis dict that analyze_option_chain_microstructure would return."""
     oc = {
         str(spot): {
@@ -226,7 +234,7 @@ class TestHunterRegimeGate:
             "call_wall": call_wall,
             "put_wall": put_wall,
             "raw_oc": oc,
-            "expiry": "2026-10-30",
+            "expiry": _near_expiry(),
             "is_synthetic": False,
         }
 
@@ -365,7 +373,7 @@ class TestColdStartVolProvisional:
             "call_wall": call_wall,
             "put_wall": put_wall,
             "raw_oc": oc,
-            "expiry": "2026-10-30",
+            "expiry": _near_expiry(),
             "is_synthetic": False,
         }
 

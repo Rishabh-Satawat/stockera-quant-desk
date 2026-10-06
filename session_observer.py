@@ -1,9 +1,12 @@
 """Session Observer — diagnostic CLI for the Stockera Quant Desk.
 
 Usage:
-  python session_observer.py --report        single-shot health report
-  python session_observer.py --watch         refresh every 60 s during market hours
-  python session_observer.py --checkpoint    pre-flight safety check
+  python session_observer.py --report           single-shot health report
+  python session_observer.py --watch            refresh every 60 s during market hours
+  python session_observer.py --checkpoint       pre-flight safety check
+  python session_observer.py --token            Dhan token status (last 4 chars, no full token)
+  python session_observer.py --candidates [N]   top-N today's candidates with raw/adjusted scores
+  python session_observer.py --quota            today's quota usage, stale-row exclusions
 """
 
 from __future__ import annotations
@@ -15,6 +18,10 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
+
+import json
+import os
+import re
 
 from db_init import DEFAULT_DB_PATH, init_db
 
@@ -317,6 +324,190 @@ def run_checkpoint(db_path: str = DEFAULT_DB_PATH) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Token status
+# ---------------------------------------------------------------------------
+
+def show_token_status(env_path: str = r"C:\kite-agent\secrets\dhan.env") -> None:
+    """Print Dhan token status: active/expired, last 4 chars. Never prints full token."""
+    print(f"{'='*60}")
+    print("  DHAN TOKEN STATUS")
+    print(f"{'='*60}")
+
+    token = ""
+    try:
+        # Try env-file first (covers Windows production path and test overrides)
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r"DHAN_ACCESS_TOKEN\s*=\s*(.+)", line.strip())
+                    if m:
+                        token = m.group(1).strip()
+                        break
+    except Exception:
+        pass
+
+    # Fall back to env var (already loaded via dotenv by the caller or test)
+    if not token:
+        token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
+
+    if not token:
+        print(_red("  [MISSING] DHAN_ACCESS_TOKEN not found in env or dhan.env"))
+        print(f"{'='*60}")
+        return
+
+    last4 = token[-4:] if len(token) >= 4 else "****"
+    masked = f"...{last4}"
+    print(f"  Token (masked): {masked}")
+    print(f"  Status:         active (present in environment)")
+    print(f"  Expiry policy:  24 hours (auto-renewed at 08:45 IST by supervisor)")
+    print(f"  Note:           Run --checkpoint to verify live API connectivity")
+    print(f"{'='*60}")
+
+
+# ---------------------------------------------------------------------------
+# Candidates drilldown (--candidates N)
+# ---------------------------------------------------------------------------
+
+def show_candidates(
+    top_n: int = 5,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Display top-N today's candidates with raw vs adjusted score breakdown."""
+    init_db(db_path)
+    today_ist = datetime.now(tz=_IST).strftime("%Y-%m-%d")
+    print(f"{'='*60}")
+    print(f"  TOP {top_n} CANDIDATES — {today_ist} (IST)")
+    print(f"{'='*60}")
+
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            """
+            SELECT symbol, playbook_id, tier, score, raw_score, vol_provisional,
+                   dispatched, skip_reason, score_breakdown, occurrences, setup_closed_at
+            FROM candidates
+            WHERE date(ts_signal) = ?
+              AND setup_closed_at IS NULL
+            ORDER BY score DESC
+            LIMIT ?
+            """,
+            (today_ist, top_n),
+        ).fetchall()
+        conn.close()
+    except sqlite3.OperationalError as exc:
+        print(f"  [DB error: {exc}]")
+        print(f"{'='*60}")
+        return
+
+    if not rows:
+        print("  No candidates logged today.")
+        print(f"{'='*60}")
+        return
+
+    for i, (sym, pb, tier, adj_score, raw_score, vol_prov, dispatched, skip_reason,
+            breakdown_json, occurrences, _closed) in enumerate(rows, 1):
+        adj_int = int(round(adj_score)) if adj_score is not None else 0
+        raw_int = int(round(raw_score)) if raw_score is not None else adj_int
+        prov_deduct = raw_int - adj_int
+
+        if vol_prov and prov_deduct > 0:
+            score_str = f"Score: {adj_int}/100  (raw {raw_int}, provisional -{prov_deduct})"
+        else:
+            score_str = f"Score: {adj_int}/100"
+
+        tier_label = {1: _grn("Tier 1 ✓"), 2: _yel("Tier 2"), 0: _red("Tier 0")}.get(tier, str(tier))
+        disp_str = _grn("DISPATCHED") if dispatched else _yel(f"skipped ({skip_reason or 'n/a'})")
+
+        print(f"\n  [{i}] {sym:10s}  {pb}  {tier_label}")
+        print(f"      {score_str}")
+        print(f"      Dispatched: {disp_str}   Scans: {occurrences or 1}")
+
+        try:
+            bd = json.loads(breakdown_json) if isinstance(breakdown_json, str) else (breakdown_json or {})
+            if bd:
+                pillars = [
+                    ("Regime/Structure", bd.get("regime_structure", 0)),
+                    ("Microstructure",   bd.get("microstructure", 0)),
+                    ("Vol/EM",           bd.get("volatility_em", 0)),
+                    ("R:R",              bd.get("risk_reward", 0)),
+                    ("Data Quality",     bd.get("data_quality", 0)),
+                ]
+                for name, pts in pillars:
+                    bar = "█" * int(pts / 5)
+                    print(f"      {name:20s} {pts:5.1f}  {bar}")
+        except Exception:
+            pass
+
+    print(f"\n{'='*60}")
+
+
+# ---------------------------------------------------------------------------
+# Quota display (--quota)
+# ---------------------------------------------------------------------------
+
+def show_quota(
+    ledger_path: str = r"C:\kite-agent\trades_ledger.json",
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Display today's real quota usage, excluding stale/simulated rows."""
+    today_ist = datetime.now(tz=_IST).strftime("%Y-%m-%d")
+    today_tag = f"TRD-{today_ist.replace('-', '')}"
+
+    print(f"{'='*60}")
+    print(f"  QUOTA STATUS — {today_ist} (IST)")
+    print(f"{'='*60}")
+
+    trades: list = []
+    if os.path.exists(ledger_path):
+        try:
+            with open(ledger_path, "r", encoding="utf-8-sig") as f:
+                trades = json.load(f)
+        except Exception as exc:
+            print(f"  [Could not read ledger: {exc}]")
+
+    # All trades in the ledger
+    all_today = [t for t in trades if t.get("trade_id", "").startswith(today_tag)]
+    # Stale: rows that don't belong to today OR are simulated
+    real_today = [
+        t for t in all_today
+        if t.get("source", "LIVE") != "SIMULATED"
+    ]
+    stale_rows = [t for t in trades if not t.get("trade_id", "").startswith(today_tag)]
+    simulated_today = [t for t in all_today if t.get("source", "LIVE") == "SIMULATED"]
+
+    naked_real = [t for t in real_today if t.get("book") == "NAKED"]
+    hedged_real = [t for t in real_today if t.get("book") == "HEDGED"]
+
+    naked_rem = max(0, 3 - len(naked_real))
+    hedged_rem = max(0, 3 - len(hedged_real))
+
+    def _quota_bar(used: int, limit: int) -> str:
+        used_c = min(used, limit)
+        bar = "█" * used_c + "░" * (limit - used_c)
+        colour = _red if used >= limit else (_yel if used > 0 else _grn)
+        return colour(f"[{bar}] {used}/{limit}")
+
+    print(f"\n  Naked  book:  {_quota_bar(len(naked_real), 3)}  ({naked_rem} remaining)")
+    print(f"  Hedged book:  {_quota_bar(len(hedged_real), 3)}  ({hedged_rem} remaining)")
+
+    if stale_rows:
+        print(f"\n  Excluded stale rows (prior sessions): {len(stale_rows)}")
+    if simulated_today:
+        print(f"  Excluded SIMULATED rows today:        {len(simulated_today)}")
+
+    if real_today:
+        print(f"\n  Today's real dispatches:")
+        for t in real_today:
+            tid = t.get("trade_id", "?")
+            book = t.get("book", "?")
+            sym = t.get("symbol", "?")
+            strategy = t.get("strategy", "?")[:40]
+            print(f"    {tid}  {book:6s}  {sym:10s}  {strategy}")
+
+    print(f"\n{'='*60}")
+
+
+# ---------------------------------------------------------------------------
 # Market-hours helper
 # ---------------------------------------------------------------------------
 
@@ -347,7 +538,30 @@ def main() -> None:
         action="store_true",
         help="Run pre-flight safety check",
     )
+    group.add_argument(
+        "--token",
+        action="store_true",
+        help="Show Dhan token status (masked — never prints full token)",
+    )
+    group.add_argument(
+        "--candidates",
+        nargs="?",
+        const=5,
+        type=int,
+        metavar="N",
+        help="Show top-N today's candidates with raw/adjusted score breakdown (default 5)",
+    )
+    group.add_argument(
+        "--quota",
+        action="store_true",
+        help="Show today's real quota usage excluding stale/simulated rows",
+    )
     parser.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to SQLite DB")
+    parser.add_argument(
+        "--ledger",
+        default=r"C:\kite-agent\trades_ledger.json",
+        help="Path to trades_ledger.json (for --quota)",
+    )
     args = parser.parse_args()
 
     if args.checkpoint:
@@ -356,6 +570,18 @@ def main() -> None:
 
     if args.report:
         print(build_report(args.db))
+        return
+
+    if args.token:
+        show_token_status()
+        return
+
+    if args.candidates is not None:
+        show_candidates(top_n=args.candidates, db_path=args.db)
+        return
+
+    if args.quota:
+        show_quota(ledger_path=args.ledger, db_path=args.db)
         return
 
     # --watch

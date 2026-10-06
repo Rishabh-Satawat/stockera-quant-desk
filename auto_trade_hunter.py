@@ -107,7 +107,11 @@ def hunt_market_once():
             except Exception:
                 trades = []
 
-    today_trades = [t for t in trades if t.get("trade_id", "").startswith(today_tag)]
+    today_trades = [
+        t for t in trades
+        if t.get("trade_id", "").startswith(today_tag)
+        and t.get("source", "LIVE") != "SIMULATED"
+    ]
     hedged_trades = [t for t in today_trades if t.get("book") == "HEDGED"]
     naked_trades = [t for t in today_trades if t.get("book") == "NAKED"]
 
@@ -261,6 +265,14 @@ def hunt_market_once():
         reg_line = f"Regime: {sig.direction} / {sig.vol_regime} / {sig.playbook_id}"
         conf_block = format_confluence_breakdown(sig, score_result)
 
+        # Provisional score line: show raw vs adjusted when vol is cold-start provisional
+        raw_score_val = score_result.get("raw_score", score_int)
+        if sig.vol_provisional and raw_score_val != score_int:
+            prov_deduct = int(round(raw_score_val)) - score_int
+            score_display_line = f"\n📊 <b>Score: {score_int}/100</b> (raw {int(round(raw_score_val))}, provisional -{prov_deduct})"
+        else:
+            score_display_line = f"\n📊 <b>Score: {score_int}/100</b>"
+
         # ── Naked directional (PB1) ──
         if sig.playbook_id == "PB1" and len(naked_trades) + dispatched_naked < 3:
             strike = sig.atm_strike or float(atm)
@@ -312,7 +324,6 @@ def hunt_market_once():
                     f"• *Downside Target Wall:* {put_wall:.0f} (Next Major Support)"
                 )
 
-            provisional_tag = "\n⚠️ *PROVISIONAL (Cold-Start IVR)*" if sig.vol_provisional else ""
             msg = f"""🚨 *STOCKERA QUANT: NAKED DIRECTIONAL BUY ALERT* 🚨
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
@@ -333,7 +344,7 @@ def hunt_market_once():
 • *Realized R:R Ratio:* 1 : 2.50 ✅
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 *{reg_line}*
-{conf_block}{provisional_tag}
+{conf_block}{score_display_line}
 ⚡ *Status:* ACTIVE | Managed by AURA Sentinel"""
             print(f"\n🚀 DISPATCHING NAKED ALERT (score={score_int}/100):\n{msg}\n")
             send_telegram_alert(msg)
@@ -363,7 +374,15 @@ def hunt_market_once():
             lower_be = s_pe - net_credit
             upper_be = s_ce + net_credit
 
-            strategy_name = "Iron Butterfly (Max Pain Pin)" if sig.playbook_id == "PB2" else "0DTE Delta-Neutral Iron Condor"
+            if sig.playbook_id == "PB2":
+                strategy_name = "Iron Butterfly (Max Pain Pin)"
+            else:
+                # PB6: dynamic label using real DTE — never label 0DTE unless DTE == 0
+                pb6_dte = getattr(sig, "dte", 0)
+                if pb6_dte == 0:
+                    strategy_name = "0DTE Delta-Neutral Iron Condor"
+                else:
+                    strategy_name = f"Iron Condor ({pb6_dte} DTE)"
             trade_id = f"{today_tag}-HEDGE-{len(hedged_trades)+dispatched_hedged+1:02d}"
             contract = f"{sym} {s_pe:.0f} PE / {s_ce:.0f} CE Condor"
 
@@ -385,7 +404,6 @@ def hunt_market_once():
             save_cooldown_state(cooldowns)
             dispatched_hedged += 1
 
-            provisional_tag = "\n⚠️ *PROVISIONAL (Cold-Start IVR)*" if sig.vol_provisional else ""
             msg = f"""🚨 *STOCKERA QUANT: HEDGED BASKET ALERT* 🚨
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 *Asset:* {sym} | *Live Spot:* ₹{spot:,.2f}
@@ -407,7 +425,7 @@ def hunt_market_once():
    4. 🔴 `SELL {sym} {s_pe:.0f} PE @ ₹{p_spe:.2f} (Short Put)`
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 *{reg_line}*
-{conf_block}{provisional_tag}
+{conf_block}{score_display_line}
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 💰 *RISK & REWARD BLUEPRINT ({lot} Qty / 1 Lot):*
 • *Net Credit Collected:* +₹{net_credit:.2f} / lot

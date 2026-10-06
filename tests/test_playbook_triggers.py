@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from datetime import date
 from playbook_triggers import (
     PlaybookSignal,
     evaluate_pb1,
@@ -11,7 +12,11 @@ from playbook_triggers import (
     evaluate_all_playbooks,
     _atm,
     _compute_pin_score,
+    _compute_dte,
 )
+
+# Reference date that makes "2026-10-30" exactly 7 DTE (within gate)
+_REF_DATE = date(2026, 10, 23)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -237,7 +242,8 @@ class TestPB6:
     def test_normal_vol_in_corridor_triggers(self):
         sig = evaluate_pb6("NIFTY",
                            _analysis(spot=22000.0, call_wall=22500.0, put_wall=21500.0),
-                           _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0), step=50)
+                           _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0), step=50,
+                           _reference_date=_REF_DATE)
         assert sig is not None
         assert sig.playbook_id == "PB6"
         assert sig.instrument_type == "IRON_CONDOR"
@@ -245,38 +251,44 @@ class TestPB6:
     def test_low_vol_triggers(self):
         sig = evaluate_pb6("NIFTY",
                            _analysis(spot=22000.0, call_wall=22500.0, put_wall=21500.0),
-                           _regime("NEUTRAL", vol="LOW_VOL", direction_score=0), step=50)
+                           _regime("NEUTRAL", vol="LOW_VOL", direction_score=0), step=50,
+                           _reference_date=_REF_DATE)
         assert sig is not None
 
     def test_elevated_vol_returns_none(self):
         sig = evaluate_pb6("NIFTY",
                            _analysis(spot=22000.0, call_wall=22500.0, put_wall=21500.0),
-                           _regime("NEUTRAL", vol="ELEVATED_VOL", direction_score=0), step=50)
+                           _regime("NEUTRAL", vol="ELEVATED_VOL", direction_score=0), step=50,
+                           _reference_date=_REF_DATE)
         assert sig is None
 
     def test_high_vol_returns_none(self):
         sig = evaluate_pb6("NIFTY",
                            _analysis(spot=22000.0, call_wall=22500.0, put_wall=21500.0),
-                           _regime("NEUTRAL", vol="HIGH_VOL", direction_score=0), step=50)
+                           _regime("NEUTRAL", vol="HIGH_VOL", direction_score=0), step=50,
+                           _reference_date=_REF_DATE)
         assert sig is None
 
     def test_spot_outside_corridor_returns_none(self):
         # spot above call_wall
         sig = evaluate_pb6("NIFTY",
                            _analysis(spot=22600.0, call_wall=22500.0, put_wall=21500.0),
-                           _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0), step=50)
+                           _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0), step=50,
+                           _reference_date=_REF_DATE)
         assert sig is None
 
     def test_spot_at_call_wall_returns_none(self):
         sig = evaluate_pb6("NIFTY",
                            _analysis(spot=22500.0, call_wall=22500.0, put_wall=21500.0),
-                           _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0), step=50)
+                           _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0), step=50,
+                           _reference_date=_REF_DATE)
         assert sig is None
 
     def test_strike_structure(self):
         sig = evaluate_pb6("NIFTY",
                            _analysis(spot=22000.0, call_wall=22500.0, put_wall=21500.0),
-                           _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0), step=50)
+                           _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0), step=50,
+                           _reference_date=_REF_DATE)
         assert sig is not None
         assert sig.short_strike_ce == 22500.0
         assert sig.short_strike_pe == 21500.0
@@ -286,14 +298,15 @@ class TestPB6:
     def test_reason_contains_corridor(self):
         sig = evaluate_pb6("NIFTY",
                            _analysis(spot=22000.0, call_wall=22500.0, put_wall=21500.0),
-                           _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0), step=50)
+                           _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0), step=50,
+                           _reference_date=_REF_DATE)
         assert "corridor" in sig.reason.lower()
 
     def test_vol_provisional_propagated(self):
         sig = evaluate_pb6("NIFTY",
                            _analysis(spot=22000.0, call_wall=22500.0, put_wall=21500.0),
                            _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0, provisional=True),
-                           step=50)
+                           step=50, _reference_date=_REF_DATE)
         assert sig is not None
         assert sig.vol_provisional is True
 
@@ -330,6 +343,7 @@ class TestEvaluateAllPlaybooks:
             _analysis(spot=22000.0, max_pain=22000.0, call_wall=22500.0, put_wall=21500.0),
             _regime("NEUTRAL", vol="NORMAL_VOL", direction_score=0),
             step=50,
+            _reference_date=_REF_DATE,
         )
         pb_ids = [s.playbook_id for s in result]
         assert "PB2" in pb_ids

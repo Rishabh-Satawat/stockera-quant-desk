@@ -32,6 +32,33 @@ _IST = ZoneInfo("Asia/Kolkata")
 _SCRIP_MAP = {"NIFTY": 13, "BANKNIFTY": 25, "FINNIFTY": 27, "SENSEX": 51}
 _SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
 
+# Flag to suppress duplicate auth-expired alerts within the same session
+_AUTH_ALERT_SENT = False
+
+
+def _dispatch_auth_expired_alert() -> None:
+    """Send a one-time high-priority Telegram alert when a Dhan 401/403 is detected."""
+    global _AUTH_ALERT_SENT
+    if _AUTH_ALERT_SENT:
+        return
+    _AUTH_ALERT_SENT = True
+    try:
+        import os as _os
+        from dotenv import load_dotenv as _ldenv
+        _ldenv(r"C:\kite-agent\secrets\telegram.env")
+        bot_token = _os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        chat_id = _os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        if not bot_token or not chat_id:
+            return
+        msg = "🚨 DHAN TOKEN EXPIRED — AUTH REQUIRED\nDhan API returned 401/403. Run update_dhan_token.py with a fresh access token before next session."
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=5,
+        )
+    except Exception as exc:
+        logger.error("Failed to send AUTH_EXPIRED Telegram alert: %s", exc)
+
 # Global rate limiter: at most 1 request per 3 s across all symbols
 _RATE_LOCK = threading.Lock()
 _LAST_REQUEST_TS: float = 0.0
@@ -55,7 +82,11 @@ def _throttled_post(url: str, payload: dict, timeout: int = 5) -> Optional[dict]
             _LAST_REQUEST_TS = time.monotonic()
             if r.status_code == 200:
                 return r.json()
-            logger.warning("HTTP %s from %s", r.status_code, url)
+            if r.status_code in (401, 403):
+                logger.error("AUTH_EXPIRED: HTTP %s from Dhan API — token rotation required", r.status_code)
+                _dispatch_auth_expired_alert()
+            else:
+                logger.warning("HTTP %s from %s", r.status_code, url)
             return None
         except Exception as exc:
             logger.error("Request failed %s: %s", url, exc)
