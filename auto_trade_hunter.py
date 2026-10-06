@@ -41,7 +41,7 @@ def send_telegram_alert(msg: str):
     _require_telegram_token()
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=5)
     except Exception as e:
         logger.warning("Telegram notice: %s", e)
 

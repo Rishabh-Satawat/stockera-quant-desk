@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 import requests
 
 from db_init import init_db, get_connection, DEFAULT_DB_PATH
+import bar_builder as _bar_builder
 
 load_dotenv(r"C:\kite-agent\secrets\dhan.env")
 _CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "").strip()
@@ -111,7 +112,31 @@ def _fetch_and_persist(symbol: str, db_path: str) -> int:
         return 0
 
     ts_ist = datetime.datetime.now(tz=_IST).isoformat()
+
+    # Store underlying spot price as a SPOT sentinel row so bar_builder
+    # can aggregate underlying_bars without a separate API call.
+    underlying_ltp = d.get("last_price") or d.get("underlying_ltp") or d.get("underlyingLtp")
     rows = []
+    if underlying_ltp is not None:
+        try:
+            _ultp = float(underlying_ltp)
+            if _ultp > 0:
+                rows.append((
+                    symbol,
+                    active_expiry,
+                    0.0,        # strike = 0 for spot sentinel
+                    "SPOT",
+                    ts_ist,
+                    _ultp,
+                    0,          # oi
+                    0,          # volume
+                    None,       # iv
+                    None, None, None, None,  # greeks
+                    scrip_id,
+                    0,          # is_synthetic
+                ))
+        except (TypeError, ValueError):
+            pass
     for strike_key, legs in oc.items():
         try:
             strike = float(strike_key)
@@ -296,6 +321,19 @@ def poll_once(symbol: str, db_path: str = DEFAULT_DB_PATH) -> int:
     return _fetch_and_persist(symbol, db_path)
 
 
+def _kick_bar_builder(db_path: str) -> None:
+    """Fire bar_builder.build_bars() in a daemon thread — non-blocking."""
+    def _run():
+        try:
+            summary = _bar_builder.build_bars(db_path)
+            logger.info("bar_builder cycle complete: %s", summary)
+        except Exception as exc:
+            logger.error("bar_builder error: %s", exc)
+
+    t = threading.Thread(target=_run, daemon=True, name="bar-builder")
+    t.start()
+
+
 def run_forever(db_path: str = DEFAULT_DB_PATH) -> None:
     """Round-robin poller across all 4 symbols. Blocks until interrupted."""
     init_db(db_path)
@@ -313,6 +351,12 @@ def run_forever(db_path: str = DEFAULT_DB_PATH) -> None:
         except Exception as exc:
             logger.error("Unhandled error polling %s: %s", symbol, exc)
         idx += 1
+
+        # After every full cycle (all 4 symbols polled), trigger bar aggregation
+        # in a background daemon thread so it never delays the rate-limited loop.
+        if idx % len(_SYMBOLS) == 0:
+            _kick_bar_builder(db_path)
+
         # Sleep between symbols so we don't hit the rate limit back-to-back.
         # Each symbol needs 2 requests (expirylist + chain); the throttle
         # adds ~3.1 s per request internally.  Extra 2 s between symbols

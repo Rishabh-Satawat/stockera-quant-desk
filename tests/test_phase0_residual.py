@@ -57,12 +57,12 @@ class TestP010LiveSpotNoFallback(unittest.TestCase):
             from live_spot_service import get_live_spots
             spots = get_live_spots()
 
-        self.assertEqual(spots["NIFTY"], 0.0,
-                         "NIFTY must be 0.0 when all feeds fail — no hardcoded fallback")
-        self.assertEqual(spots["BANKNIFTY"], 0.0,
-                         "BANKNIFTY must be 0.0 when all feeds fail")
-        self.assertEqual(spots["SENSEX"], 0.0,
-                         "SENSEX must be 0.0 when all feeds fail")
+        self.assertIsNone(spots["NIFTY"],
+                          "NIFTY must be None when all feeds fail — callers treat None as DATA_FAULT")
+        self.assertIsNone(spots["BANKNIFTY"],
+                          "BANKNIFTY must be None when all feeds fail")
+        self.assertIsNone(spots["SENSEX"],
+                          "SENSEX must be None when all feeds fail")
 
     def test_fetch_live_spot_returns_none_synthetic_when_all_feeds_fail(self):
         """expiry_settlement_watchdog.fetch_live_spot must return (None, True) when feeds fail."""
