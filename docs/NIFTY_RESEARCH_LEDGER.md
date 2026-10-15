@@ -1,10 +1,8 @@
-> Copy of the canonical ledger kept in project files at `/mnt/project-files/knowledge/NIFTY_RESEARCH_LEDGER.md`. Update both after each research round.
-
 # NIFTY straddle research ledger (canonical, read this first)
 
 This is the single source of truth for the Tradetron NIFTY short-straddle research. Any new thread should read this file before doing anything else.
 
-- Last updated: 2026-10-13 (Round 8 done: final backtest round; champion R8-R1; next step is Live Offline).
+- Last updated: 2026-10-15 (Round 9 done: champion R9-X3s20, the R8-R1 rules with the Supertrend exit read on 3-minute candles; next step is Live Offline).
 - Owner: Rishabh.
 - The detailed tables live in the files listed in section 9. This file holds the decisions, rules, ids and lessons.
 
@@ -24,24 +22,25 @@ This is the single source of truth for the Tradetron NIFTY short-straddle resear
 
 ## 1. Current strategy (champion) and what it really earns
 
-**R8-R1 "RE15 entries until 14:00", Tradetron id 999154822** (crowned Round 8). NIFTY weekly (Current Week), intraday, 1 lot per leg.
+**R9-X3s20 "R8R1 exit ST on 3m", Tradetron id 999181390** (crowned Round 9). NIFTY weekly (Current Week), intraday, 1 lot per leg.
 - **Legs:**
   - Sell CE at `ATM SPOT("NIFTY 50", 0)`.
   - Sell PE at `ATM SPOT("NIFTY 50", -1)` (one strike below ATM).
 - **Entry:** Time 09:15 to 14:00, the 5-minute Supertrend(20, 3) of the CE+PE combined premium is above the last closed candle's close, and the position is flat.
 - **Exits** (Universal Exit, OR-joined):
-  - the traded legs' combined premium closes above its Supertrend(20, 3) on 5-minute candles;
+  - the traded legs' combined premium closes above its Supertrend(20, 3) on **3-minute** candles (the only change from R8-R1);
   - strategy P&L ≥ 9,000 × multiplier;
   - Time ≥ 15:18.
 - **Strategy TSL:** 3,000 / 1,500 / 1,000, in rupees.
-- **Reactivation:** 15 min, so it re-enters after an exit until 14:00.
+- **Reactivation:** 15 min, so it re-enters at the new ATM after an exit until 14:00.
 
-**Realistic numbers (Avg fills, 2021-10-13 to 2026-09-08):** net ₹4,64,698, DD ₹31,938, Sharpe 1.81, 3,044 trades. Job ttbt-999129674261013, report https://tradetron.tech/bt/view/6bb8ce9b4342f7b1ef5f6589658752b3
-- Out-of-sample 2020-01-01 to 2021-11-16: ₹1,59,252 (job ttbt-999129762261013).
-- Open fills (opening-print ceiling): ₹11,06,391 (job ttbt-999129782261013).
-- **Brokerage is not modelled** (Tradetron cost model: ₹0 brokerage). At Zerodha's ₹20 per order the 6,088 orders cost about ₹1.44 lakh with GST, so about ₹3.2 lakh net (X7.2 on the same basis about ₹2.7 lakh).
-- Worst single trade −₹31,798; profit factor 1.12.
-- **From Round 8 on, the Avg-fill baseline is the R8 run of X7.2 on the 60-month window: ttbt-999129590261013 (net ₹3,82,980, DD ₹28,525).**
+**Realistic numbers (Avg fills, 2021-10-13 to 2026-09-10):** net ₹5,57,142, DD ₹27,219, Sharpe 2.41, 3,900 trades, win 61%, last 12 months ₹1,47,911. Job ttbt-999147714261015, report https://tradetron.tech/bt/view/21afa12bd2bd19e0b63e8d5b7628d39c
+- Vs R8-R1: net +19.9%, DD −14.8%, paired t 1.71; ≥ R8-R1 in 5 of 6 years.
+- Out-of-sample 2020-01-01 to 2021-11-16: ₹1,46,062, DD ₹18,509 (job ttbt-999148406261015; R8-R1 there: ₹1,59,252, DD ₹34,398).
+- **Brokerage is not modelled.** At about ₹47 per round trip the estimate is ≈ ₹3.73 lakh, vs ≈ ₹3.21 lakh for R8-R1 (my arithmetic).
+- **Hero 2 / alternative: R9-X1, id 999180286** (P30 + RE15 + until 14:00 + exit if spot moves ±0.6% from entry spot). Net ₹5,50,966, DD ₹27,212; best out-of-sample ever (₹2,07,380, DD ₹15,447) but weak 2025.
+- **R8-R1, id 999154822** (₹4,64,698, DD ₹31,938) is the fallback after X1.
+- Full write-up: `reports/round9/round9-results-and-heroes.md`.
 
 **Previous champion AP-X7.2, id 999151690:** same rules but one trade a day (reactivation 360) and entries any time. Its ₹10.4 lakh figure relies on the 09:15 Open print; on Avg fills it is ₹3.83 lakh. It is the fallback if Live Offline fails the gate.
 
@@ -54,6 +53,7 @@ This is the single source of truth for the Tradetron NIFTY short-straddle resear
 | R4 | AP-X7.1 | 999147870 | 1,029,978 | 25,870 | PE one strike OTM (t 2.57) |
 | R5 | AP-X7.2 | 999151690 | 1,036,527 | 20,108 | Supertrend period 20 (OOS +7.6%, DD −17.5%) |
 | R8 | R8-R1 | 999154822 | 1,106,391 (Avg: 464,698) | 28,935 (Avg: 31,938) | Re-entry 15 min, entries until 14:00 (Avg t 2.03, OOS +22%) |
+| R9 | R9-X3s20 | 999181390 | Avg only: 557,142 | Avg: 27,219 | Supertrend exit on 3m candles (t 1.71 vs R8-R1, DD −15%, OOS DD −46%) |
 
 ## 3. What has been tested and rejected (do not re-run)
 
@@ -101,6 +101,13 @@ This is the single source of truth for the Tradetron NIFTY short-straddle resear
 - RSI(14) of premium < 40 / 45 / 50: no robust gain (t 0.57 at 45, neighbours flat). Also adds nothing on top of the 14:00 cutoff.
 - Spot ADX(14) < 25: −53%, DD 78k.
 - Loser cut 1.6× gated on VIX ≥ 16: still loses 2026 (₹28k vs ₹94k). Leg cuts are dead.
+
+**Round 9 reversal exits (Avg fills)**
+- India VIX +4% in 30 min exit: −21% net, DD 50k.
+- Leg-skew exit (CE ≥ 2.5× PE or PE ≥ 2× CE): −11%, 9,734 trades, last 12m collapses.
+- Premium 15% above its 1-hour low: −76%, whipsaw.
+- 2m Supertrend exit: DD down but net flat, last 12m weak.
+- 3m exit + spot 0.6% together (C1): +4% over X3s20 is noise (t 0.42) and costs more in brokerage.
 
 ## 4. Pass rule (pre-register before every run)
 
@@ -174,7 +181,8 @@ A `## PYTHON BLOCK` with an internal time-gated `if` makes every entry fire at t
 | R5 | 2026-10-12 | ₹840 | X7.2 crowned (period 20) |
 | R6 | 2026-10-12/13 | ₹300 | Found the 09:15 fill dependence |
 | R7 | 2026-10-13 | ₹220 | Realistic fills; leg tweaks fail recently; re-entry is the candidate |
-| R8 | 2026-10-13 | ₹280 | R8-R1 crowned (re-entry + entries until 14:00); backtesting closed |
+| R8 | 2026-10-13 | ₹280 | R8-R1 crowned (re-entry + entries until 14:00) |
+| R9 | 2026-10-15 | ₹280 | R9-X3s20 crowned (3m Supertrend exit); spot-exit X1 is hero 2 |
 
 ### Round 7 (Avg fills, baseline ttbt-999129342261013). Spent ₹220 on 11 runs; no crown.
 
@@ -224,11 +232,36 @@ A `## PYTHON BLOCK` with an internal time-gated `if` makes every entry fire at t
 - **Decision:** backtesting is closed for NIFTY. Next is Live Offline for 10–20 sessions on 999154822, logging 09:15 and re-entry fills, then Rishabh's own go-live step.
 - **Full write-up:** `reports/round8/round8-results-and-champion.md`. Job ids in that file and in the workbook.
 
+### Round 9 (Avg fills, 2021-10-13 to 2026-09-10). Spent ₹280 net; R9-X3s20 crowned.
+
+Asked for: detect reversals earlier, exit, re-enter at the new ATM after the move.
+
+| Test | id | Net | DD | Last 12m | Verdict |
+|---|---|---|---|---|---|
+| B1 P30 + RE15 + 14:00 | 999180290 | 475,398 | 30,888 | 140,471 | Base |
+| X3 3m exit (ST 30) | 999180322 | 521,352 | 25,831 | 132,514 | Neighbour agrees; OOS 135,444 |
+| X3n2 2m exit | 999181386 | 472,155 | 22,841 | 107,431 | DD-down neighbour |
+| **X3s20 R8-R1 + 3m exit** | **999181390** | **557,142** | **27,219** | **147,911** | **Champion (t 1.71; OOS 146,062 / DD 18,509)** |
+| X1 spot ±0.6% exit | 999180286 | 550,966 | 27,212 | 127,314 | Hero 2 (OOS 207,380 / DD 15,447; weak 2025) |
+| X1n8 spot ±0.8% | 999182578 | 510,675 | 29,936 | 128,094 | Neighbour agrees |
+| C1 3m + spot 0.6% | 999182570 | 579,940 | 24,736 | 125,823 | Not adopted |
+| X2 leg skew | 999180294 | 422,325 | 26,930 | 58,213 | Rejected |
+| X4 VIX jump | 999180330 | 375,894 | 50,203 | 79,116 | Rejected |
+| X5 premium bounce | 999180338 | 112,470 | 31,678 | 11,084 | Rejected |
+
+- **Lesson:** no signal predicts a reversal; a faster exit on the same signal catches it earlier, and the 15-minute re-entry re-sells the new ATM. Exit-only timeframe changes help where whole-strategy timeframe changes hurt.
+- **Win rate** stayed at 60–62% on every serious variant; gains came from smaller losers.
+- **Mechanics learned:** backtest end must be ≥ 35 days before today; `tt_backtest_status` lags, use `tt_backtest_trades(job, limit=1)` `book_state` and then `tt_backtest_result`; fleet runs took 1.5–3 hours this round.
+- **Next:** Live Offline on 999181390 (needs NFO enabled on the Zerodha connection in Tradetron first).
+- **Full write-up:** `reports/round9/round9-master-plan.md`, `reports/round9/round9-results-and-heroes.md`.
+
 ## 9. Where everything lives
 
 - **Workbook** (all rounds, report links): `/mnt/project-files/reports/nifty-master-research-workbook.xlsx`
 - **Narrative report:** `/mnt/project-files/reports/tradetron-straddle-risk-variants.md`
 - **Round 7 plan:** `/mnt/project-files/reports/round7/round7-master-plan.md`
+- **Round 9 plan and results:** `/mnt/project-files/reports/round9/round9-master-plan.md`, `/mnt/project-files/reports/round9/round9-results-and-heroes.md`
+- **Reusable skill (portable):** `/mnt/project-files/knowledge/skills/options-strategy-alpha-loop/SKILL.md`
 - **Round 8 plan and results:** `/mnt/project-files/reports/round8/round8-final-master-plan.md`, `/mnt/project-files/reports/round8/round8-results-and-champion.md`
 - **Live overlay plan** (OI, PCR, GEX, CVD leg rules): `/mnt/project-files/reports/round7/live-overlay-plan.md`
 - **R4/R5 sheets:** `reports/alpha-pro-master-sheet.csv`, `reports/nifty-round5-master-sheet.csv`
