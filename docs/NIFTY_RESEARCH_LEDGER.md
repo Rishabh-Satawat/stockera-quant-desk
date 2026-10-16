@@ -47,7 +47,7 @@ This is the single source of truth for the Tradetron NIFTY short-straddle resear
 
 **Optional tweak:** target 12,000 (R10-TP12, id 999187942).
 - +2.7% net, expectancy +3%, same DD, t 2.25, ≥ P30 in all 6 years.
-- OOS 2020–21: ₹3,30,503 / DD ₹17,355.
+- OOS 2020–21: ₹3,30,503 / DD ₹17,355. The P30 OOS run failed on the engine (job ttbt-999151782261016, report 4); vs X7.2 OOS (₹3,31,351 / DD ₹19,893) TP12 is flat on net with 13% less DD.
 - On Avg fills: +1.6% (t 0.56) with DD +28%.
 - It is below the +5% bar, so it goes to Live Offline at most.
 
@@ -130,7 +130,7 @@ This is the single source of truth for the Tradetron NIFTY short-straddle resear
 - Faster exits without re-entry:
   - 3m Supertrend exit: −8.5%;
   - spot 0.6% exit: −6.9%, DD +29%.
-- Wider legs CE+1 / PE−1: −7.4%, DD +21%.
+- Wider legs CE+1 / PE−1: −7.4%, DD +21%. CE 0 / PE−2: −2.1%, last 12 months 284k vs 341k.
 - No TSL: −1.7%. Looser TSL 4500/2250/1500 on TP12: weaker than TP12.
 - Exit Supertrend period 40: −0.4% (plateau).
 - Target 15,000 / 20,000: +2.2% / +2.1%. This is a plateau; TP12 is best.
@@ -313,7 +313,7 @@ Asked for: a much stronger variant than P30 (better ROI, CAGR and expectancy per
 | T2 spot 0.6% exit | 999187930 | 971,166 | −6.9% | 25,506 | 405 | Rejected |
 | W2 CE+1 / PE−1 | 999187938 | 965,545 | −7.4% | 23,894 | 399 | Rejected |
 | T1 3m exit | 999187926 | 954,720 | −8.5% | 18,704 | 383 | Rejected |
-| W1 CE0 / PE−2 | 999187934 | pending | | | | |
+| W1 CE0 / PE−2 | 999187934 | 1,021,616 | −2.1% | 19,714 | 426 | Rejected (last 12m 284k vs 341k) |
 
 - **Lesson:** P30's edge is one 09:15 sale of the rich opening premium held until the trend turns. On Open fills, every change that trades more or exits sooner lowers expectancy. The fill basis decides which variant looks best, so from now on report Open and Avg side by side.
 - **Next real levers (new round, Rishabh decides):**
