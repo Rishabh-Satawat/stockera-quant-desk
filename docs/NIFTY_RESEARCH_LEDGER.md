@@ -2,7 +2,7 @@
 
 This is the single source of truth for the Tradetron NIFTY short-straddle research. Any new thread should read this file before doing anything else.
 
-- Last updated: 2026-10-16 (Round 10 done: R6-P30 reinstated as champion on Open fills, the basis of its own report and of the live fills; no variant beat it by 5%).
+- Last updated: 2026-10-16 (Round 11 done: P30 remains champion; SENSEX data gaps inconclusive; iron fly ±1000 pt fails on net −14.4% and DD worse).
 - Owner: Rishabh.
 - The detailed tables live in the files listed in section 9. This file holds the decisions, rules, ids and lessons.
 
@@ -22,7 +22,7 @@ This is the single source of truth for the Tradetron NIFTY short-straddle resear
 
 ## 1. Current strategy (champion) and what it really earns
 
-**R6-P30 "NIFTY X7.2 ST period 30", Tradetron id 999154354** (Rishabh's pick, confirmed in Round 10). It runs LIVE AUTO on his account. NIFTY weekly (Current Week), intraday, 1 lot per leg.
+**R6-P30 "NIFTY X7.2 ST period 30", Tradetron id 999154354** (Rishabh's pick, confirmed in Round 10). It is LIVE AUTO on his account (SID 999319106). NIFTY weekly (Current Week), intraday, 1 lot per leg.
 - **Legs:**
   - Sell CE at `ATM SPOT("NIFTY 50", 0)`.
   - Sell PE at `ATM SPOT("NIFTY 50", -1)`.
@@ -93,6 +93,7 @@ This is the single source of truth for the Tradetron NIFTY short-straddle resear
 **Wings**
 - 200 pt: lost most of the edge.
 - 500 pt: DD doubled.
+- 1,000 pt (ATM±20 strikes, iron fly R11-SB): net −14.4% vs P30, DD 22.14% vs P30's 10.985% — both worse. Far OTM wing premiums are tiny, so they barely reduce credit but widen the loss zone. Rejected.
 
 **Filters**
 - VIX ≥ SMA20: −54%.
@@ -218,6 +219,7 @@ A `## PYTHON BLOCK` with an internal time-gated `if` makes every entry fire at t
 | R8 | 2026-10-13 | ₹280 | R8-R1 crowned (re-entry + entries until 14:00) |
 | R9 | 2026-10-15 | ₹280 | R9-X3s20 crowned (3m Supertrend exit); spot-exit X1 is hero 2 (both on Avg fills) |
 | R10 | 2026-10-16 | ₹400 | P30 reinstated on Open fills; TP12 is the only small gain; Round 9 heroes lose on Open |
+| R11 | 2026-10-16 | ₹40 | P30 remains champion; SENSEX inconclusive (data gaps); iron fly ±1000 pt fails both gates |
 
 ### Round 7 (Avg fills, baseline ttbt-999129342261013). Spent ₹220 on 11 runs; no crown.
 
@@ -321,6 +323,33 @@ Asked for: a much stronger variant than P30 (better ROI, CAGR and expectancy per
   - far wings (≥ 1,000 pt) for margin efficiency, with margin checked live.
 - **Write-up:** `reports/round10/round10-master-plan.md`, `reports/round10/round10-results-and-champion.md`, `reports/round10/round10-strategy-master-sheet.xlsx`.
 
+### Round 11 (Open fills). Spent ₹40 on 2 runs; P30 remains champion.
+
+Asked for: (A) SENSEX twin book — same P30 logic on SENSEX weekly BFO; (B) NIFTY iron fly — add wing buys at ATM±20 strikes (≈±1000 pts) to reduce margin.
+
+| Test | id | Net | vs P30 | DD (cap%) | Verdict |
+|---|---|---|---|---|---|
+| **P30 (reference)** | **999154354** | **1,043,205** | — | **10.99%** | **Champion** |
+| R11-SA SENSEX straddle | 999190510 | 9,17,650 | n/a (short window) | 21.23% | INCONCLUSIVE — HIGH SEVERITY: 142 instruments with no data, 376 unpriceable entries; window limited to 2023-08-07 to 2026-09-08 |
+| R11-SB Iron Fly ±1000 pt | 999190518 | 8,92,627 | −14.4% | 22.14% | FAIL — net below threshold and DD worse than P30 |
+
+Pass-rule check for R11-SB:
+- Net gate (+5%): ₹8,92,627 vs ₹10,43,205 → **−14.4%** → FAIL.
+- DD gate (−15%): 22.14% vs 10.99% → iron fly is 101% WORSE → FAIL.
+- OOS / trailing windows / t: not needed; both primary gates failed.
+
+Root cause of iron fly's underperformance: NIFTY ±1000 pt wings are so far OTM on weekly options that their premiums are negligible. The net credit barely shrinks vs a plain straddle, so there is no margin saving and the debit paid is a recurring drag. The protection cap at ±1000 pts is rarely reached (less than the max P30 DD), so the buy legs never earn their premium back. The higher DD is likely a real effect: on the sessions where the strategy did breach 1000 pts, the wing payoff is capped but cost was real.
+
+Lesson: wing efficiency requires EITHER tight wings (cost of premium substantial, protection fires often) OR a very large move that justifies the purchase. At ±1000 pts, neither condition holds on NIFTY weekly. Do not retest until a different strike distance is motivated.
+
+SENSEX lesson: BFO historical data before 2023-07-01 is missing. Even from 2023-07-01, 142 of the instruments encountered had no data at all (HIGH SEVERITY). A clean SENSEX test requires a platform or data provider that has full BFO chain history. Until that coverage improves the result is uninterpretable. Do not resubmit without first confirming data coverage with Tradetron support.
+
+**Results reports:**
+- R11-SA https://tradetron.tech/bt/view/86b0b99eba74c27e8e8f39219c7e4ea6
+- R11-SB https://tradetron.tech/bt/view/056f24f9784b726a48060602e3b5e2e7
+
+**Full write-up:** `reports/round11/round11-results-and-champion.md`
+
 ## 9. Where everything lives
 
 - **Workbook** (all rounds, report links): `/mnt/project-files/reports/nifty-master-research-workbook.xlsx`
@@ -328,6 +357,7 @@ Asked for: a much stronger variant than P30 (better ROI, CAGR and expectancy per
 - **Round 7 plan:** `/mnt/project-files/reports/round7/round7-master-plan.md`
 - **Round 9 plan and results:** `/mnt/project-files/reports/round9/round9-master-plan.md`, `/mnt/project-files/reports/round9/round9-results-and-heroes.md`
 - **Round 10 plan, results and master sheet:** `/mnt/project-files/reports/round10/round10-master-plan.md`, `/mnt/project-files/reports/round10/round10-results-and-champion.md`, `/mnt/project-files/reports/round10/round10-strategy-master-sheet.xlsx`
+- **Round 11 results:** `/mnt/project-files/reports/round11/round11-results-and-champion.md`
 - **Reusable skill (portable):** `/mnt/project-files/knowledge/skills/options-strategy-alpha-loop/SKILL.md`
 - **Round 8 plan and results:** `/mnt/project-files/reports/round8/round8-final-master-plan.md`, `/mnt/project-files/reports/round8/round8-results-and-champion.md`
 - **Live overlay plan** (OI, PCR, GEX, CVD leg rules): `/mnt/project-files/reports/round7/live-overlay-plan.md`
